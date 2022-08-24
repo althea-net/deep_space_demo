@@ -1,9 +1,33 @@
-use deep_space::client::Contact;
+use cosmos_sdk_proto_althea::{
+    cosmos::tx::v1beta1::{TxBody, TxRaw},
+    ibc::applications::transfer::v1::MsgTransfer,
+    tendermint::types::Block,
+};
+use deep_space::{
+    client::Contact,
+    utils::{decode_any, decode_bytes},
+};
 use futures::future::join_all;
+use lazy_static::lazy_static;
 use std::{
     collections::HashMap,
+    sync::{Arc, RwLock},
     time::{Duration, Instant},
 };
+
+lazy_static! {
+    static ref COUNTER: Arc<RwLock<Counters>> = Arc::new(RwLock::new(Counters {
+        blocks: 0,
+        transactions: 0,
+        msgs: 0
+    }));
+}
+
+pub struct Counters {
+    blocks: u64,
+    transactions: u64,
+    msgs: u64,
+}
 
 const TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -12,7 +36,7 @@ const TIMEOUT: Duration = Duration::from_secs(5);
 /// and missing history before the state sync
 /// Iterative implementation due to the limitations of async recursion in rust.
 async fn get_earliest_block(contact: &Contact, mut start: u64, mut end: u64) -> u64 {
-    while start != end {
+    while start <= end {
         let mid = start + (end - start) / 2;
         let mid_block = contact.get_block(mid).await;
         if let Ok(Some(_)) = mid_block {
@@ -21,14 +45,63 @@ async fn get_earliest_block(contact: &Contact, mut start: u64, mut end: u64) -> 
             start = mid + 1;
         }
     }
-    start
+    // off by one error correction fix bounds logic up top
+    start + 1
 }
 
-#[tokio::main(flavor = "current_thread")]
+async fn search(contact: &Contact, start: u64, end: u64) {
+    let blocks = contact.get_block_range(start, end).await.unwrap();
+
+    let mut tx_counter = 0;
+    let mut msg_counter = 0;
+    let blocks_len = blocks.len() as u64;
+    for block in blocks {
+        let block = block.unwrap();
+        for tx in block.data.unwrap().txs {
+            tx_counter += 1;
+
+            let raw_tx_any = prost_types::Any {
+                type_url: "/cosmos.tx.v1beta1.TxRaw".to_string(),
+                value: tx,
+            };
+            let tx_raw: TxRaw = decode_any(raw_tx_any).unwrap();
+            let tx_hash = sha256::digest_bytes(&tx_raw.body_bytes);
+            let body_any = prost_types::Any {
+                type_url: "/cosmos.tx.v1beta1.TxBody".to_string(),
+                value: tx_raw.body_bytes,
+            };
+            let tx_body: TxBody = decode_any(body_any).unwrap();
+            for message in tx_body.messages {
+                msg_counter += 1;
+                let ibc_transfer_any = prost_types::Any {
+                    type_url: "/ibc.applications.v1.MsgTransfer".to_string(),
+                    value: message.value,
+                };
+                let ibc_transfer: Result<MsgTransfer, _> = decode_any(ibc_transfer_any);
+
+                if let Ok(decoded_transfer) = ibc_transfer {
+                    if decoded_transfer.token.is_some() {
+                        if decoded_transfer
+                            .receiver
+                            .contains("redacted")
+                        {
+                            println!("Found it! {:?} {}", decoded_transfer, tx_hash);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut c = COUNTER.write().unwrap();
+    c.blocks += blocks_len;
+    c.transactions += tx_counter;
+    c.msgs += msg_counter;
+}
+
+#[tokio::main(flavor = "multi_thread")]
 async fn main() {
-    let contact =
-        Contact::new("http://gravitychain.io:9090", TIMEOUT, "gravity").expect("invalid url");
-    let mut blocks = HashMap::new();
+    let contact = Contact::new("http://chainripper-2.althea.net:9090", TIMEOUT, "gravity")
+        .expect("invalid url");
 
     let status = contact
         .get_chain_status()
@@ -50,17 +123,8 @@ async fn main() {
     );
     let start = Instant::now();
 
-    // the actual block download logic, we're building an array of futures which we'll
-    // hand off to be executed in parallel, note that for gravitychain.io it's a node cluster
-    // meaning not all nodes have the exact same number of blocks (they are state synced) so
-    // we may download a smaller number of blocks than the latest block we find above as our
-    // connection is load balanced across the cluster to nodes with less history.
-
-    // number of blocks to request as a single future, if we did single blocks
-    // the overhead of each connection would reduce total speed, a more complete
-    // implementation would auto-tune this value and not hand everything off to tokio
-    // at once, in order to really optimize performance given latency to the cluster.
-    const BATCH_SIZE: u64 = 100;
+    const BATCH_SIZE: u64 = 500;
+    const EXECUTE_SIZE: usize = 200;
     let mut pos = earliest_block;
     let mut futures = Vec::new();
     while pos < latest_block {
@@ -72,27 +136,30 @@ async fn main() {
             pos = latest_block;
             latest_block
         };
-        let fut = contact.get_block_range(start, end);
+        let fut = search(&contact, start, end);
         futures.push(fut);
     }
 
-    // this is where we actually hand off all the futures to tokio to execute in parallel
-    // splitting this up to run lets say 10k at a time would reduce memory usage and allow
-    // indexing the results to a local database (sled or rocksdb) for easy review and instant re-runs
-    let results = join_all(futures).await;
+    let mut futures = futures.into_iter();
 
-    // now we take the results, index them ignoring any that failed due to timeouts or
-    // other issues, a proper implementation would keep track of failures here and build
-    // another run specifically of failures.
-    for result in results.into_iter().flatten() {
-        for block in result.into_iter().flatten() {
-            blocks.insert(block.last_commit.clone().unwrap().height, block);
+    let mut buf = Vec::new();
+    while let Some(fut) = futures.next() {
+        if buf.len() < EXECUTE_SIZE {
+            buf.push(fut);
+        } else {
+            let _ = join_all(buf).await;
+            println!("Completed batch of {} blocks", BATCH_SIZE * EXECUTE_SIZE as u64);
+            buf = Vec::new();
         }
     }
+    let _ = join_all(buf).await;
 
+    let counter = COUNTER.read().unwrap();
     println!(
-        "Successfully downloaded {} blocks in {} seconds",
-        blocks.len(),
+        "Successfully downloaded {} blocks and {} tx containing {} messages in {} seconds",
+        counter.blocks,
+        counter.transactions,
+        counter.msgs,
         start.elapsed().as_secs()
     )
 }

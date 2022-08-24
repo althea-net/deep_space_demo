@@ -9,4 +9,8 @@ authors = ["Justin Kilpatrick (justin@althea.net)"]
 [dependencies]
 tokio = {version="1", features=["rt-multi-thread"]}
 deep_space = "2"
+cosmos-sdk-proto-althea = "0.13"
 futures = "0.3"
+sha256 = "1"
+prost-types ="0.10"
+lazy_static = "1.4"
