@@ -8,9 +8,20 @@ authors = ["Justin Kilpatrick (justin@althea.net)"]
 
 [dependencies]
 tokio = {version="1", features=["rt-multi-thread"]}
-deep_space = "2"
-cosmos-sdk-proto-althea = "0.13"
+num256 = "*"
+deep_space = "2.15.2"
 futures = "0.3"
 sha256 = "1"
-prost-types ="0.10"
 lazy_static = "1.4"
+prost = "0.10"
+prost-types = "0.10"
+cosmos-sdk-proto = {package = "cosmos-sdk-proto-althea", version = "0.13", features = ["bech32ibc", "ethermint"]}
+tonic = "0.7"
+gravity_proto = {git = "https://github.com/gravity-bridge/gravity-bridge", rev="e5fdc79fb9ddcd56b27326484e463475a64fcbec"}
+cosmos_gravity = {git = "https://github.com/gravity-bridge/gravity-bridge", rev="e5fdc79fb9ddcd56b27326484e463475a64fcbec"}
+gravity_utils = {git = "https://github.com/gravity-bridge/gravity-bridge", rev="e5fdc79fb9ddcd56b27326484e463475a64fcbec"}
+web30 = "0.19"
+clarity = "0.5"
+serde = { version = "1.0", features = ["derive"] }
+serde_derive = "1"
+actix-rt = "2.8"
