@@ -6,11 +6,16 @@ authors = ["Justin Kilpatrick (justin@althea.net)"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[profile.release]
+opt-level = 3
+lto = "fat"
+panic = 'unwind'
+
 [dependencies]
 tokio = {version="1", features=["rt-multi-thread"]}
 deep_space = "2"
-cosmos-sdk-proto-althea = "0.13"
+cosmos-sdk-proto-althea = "0.16"
 futures = "0.3"
 sha256 = "1"
-prost-types ="0.10"
+prost-types ="0.12"
 lazy_static = "1.4"

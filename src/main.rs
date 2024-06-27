@@ -1,6 +1,7 @@
 use cosmos_sdk_proto_althea::{
     cosmos::tx::v1beta1::{TxBody, TxRaw},
-    ibc::applications::transfer::v1::MsgTransfer,
+    ibc::{applications::transfer::v1::MsgTransfer, self},
+    cosmos::bank::v1beta1::MsgSend,
     tendermint::types::Block,
 };
 use deep_space::{
@@ -74,19 +75,14 @@ async fn search(contact: &Contact, start: u64, end: u64) {
             for message in tx_body.messages {
                 msg_counter += 1;
                 let ibc_transfer_any = prost_types::Any {
-                    type_url: "/ibc.applications.v1.MsgTransfer".to_string(),
+                    type_url: "/cosmos.bank.v1beta1.MsgSend".to_string(),
                     value: message.value,
                 };
-                let ibc_transfer: Result<MsgTransfer, _> = decode_any(ibc_transfer_any);
+                let ibc_transfer: Result<MsgSend, _> = decode_any(ibc_transfer_any);
 
                 if let Ok(decoded_transfer) = ibc_transfer {
-                    if decoded_transfer.token.is_some() {
-                        if decoded_transfer
-                            .receiver
-                            .contains("redacted")
-                        {
-                            println!("Found it! {:?} {}", decoded_transfer, tx_hash);
-                        }
+                    if decoded_transfer.from_address == "althea15np5r0cfcemug4azyewc8un8dtd7kk9kkr33c0".to_string() {
+                        println!("{}", decoded_transfer.to_address);
                     }
                 }
             }
@@ -100,7 +96,7 @@ async fn search(contact: &Contact, start: u64, end: u64) {
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
-    let contact = Contact::new("http://chainripper-2.althea.net:9090", TIMEOUT, "gravity")
+    let contact = Contact::new("http://althea.zone:9090", TIMEOUT, "althea")
         .expect("invalid url");
 
     let status = contact
