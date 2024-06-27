@@ -421,6 +421,7 @@ dependencies = [
  "cosmos-sdk-proto-althea",
  "deep_space",
  "futures",
+ "gravity_proto",
  "prost-types",
  "sha256",
  "tokio",
@@ -616,6 +617,18 @@ name = "gimli"
 version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40ecd4077b5ae9fd2e9e169b102c6c330d0605168eb0e8bf79952b256dbefffd"
+
+[[package]]
+name = "gravity_proto"
+version = "0.4.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eb69c4db10b05c61028ec77c97a7916237f43b72a48d753beb7a0efe000d3e88"
+dependencies = [
+ "cosmos-sdk-proto-althea",
+ "prost",
+ "prost-types",
+ "tonic",
+]
 
 [[package]]
 name = "h2"

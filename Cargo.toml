@@ -14,6 +14,7 @@ panic = 'unwind'
 [dependencies]
 tokio = {version="1", features=["rt-multi-thread"]}
 deep_space = "2"
+gravity_proto = "0.4"
 cosmos-sdk-proto-althea = "0.16"
 futures = "0.3"
 sha256 = "1"
