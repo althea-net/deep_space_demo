@@ -18,4 +18,4 @@ cosmos-sdk-proto-althea = "0.16"
 futures = "0.3"
 sha256 = "1"
 prost-types ="0.12"
-lazy_static = "1.4"
+clap = {version="4", features=["derive"]}

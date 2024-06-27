@@ -1,34 +1,23 @@
-use cosmos_sdk_proto_althea::{
-    cosmos::tx::v1beta1::{TxBody, TxRaw},
-    ibc::{applications::transfer::v1::MsgTransfer, self},
-    cosmos::bank::v1beta1::MsgSend,
-    tendermint::types::Block,
+use clap::Parser;
+use cosmos_sdk_proto_althea::cosmos::{
+    bank::v1beta1::MsgSend,
+    distribution::v1beta1::MsgWithdrawDelegatorReward,
+    staking::v1beta1::{MsgDelegate, MsgUndelegate},
+    tx::v1beta1::{TxBody, TxRaw},
 };
+use deep_space::address::Address;
 use deep_space::{
-    client::Contact,
-    utils::{decode_any, decode_bytes},
+    client::{types::LatestBlock, Contact},
+    utils::decode_any,
 };
 use futures::future::join_all;
-use lazy_static::lazy_static;
+use prost_types::Any;
 use std::{
     collections::HashMap,
-    sync::{Arc, RwLock},
+    hash::Hash,
+    ops::Add,
     time::{Duration, Instant},
 };
-
-lazy_static! {
-    static ref COUNTER: Arc<RwLock<Counters>> = Arc::new(RwLock::new(Counters {
-        blocks: 0,
-        transactions: 0,
-        msgs: 0
-    }));
-}
-
-pub struct Counters {
-    blocks: u64,
-    transactions: u64,
-    msgs: u64,
-}
 
 const TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -50,63 +39,181 @@ async fn get_earliest_block(contact: &Contact, mut start: u64, mut end: u64) -> 
     start + 1
 }
 
-async fn search(contact: &Contact, start: u64, end: u64) {
+/// Searches a segment of blocks for transactions to or from a target address
+/// returns a Hashmap of transactions indexed by block height
+async fn search(
+    contact: &Contact,
+    target_address: Address,
+    start: u64,
+    end: u64,
+) -> HashMap<u64, Vec<MessageWrapper>> {
     let blocks = contact.get_block_range(start, end).await.unwrap();
+    let mut txs = HashMap::new();
 
-    let mut tx_counter = 0;
-    let mut msg_counter = 0;
     let blocks_len = blocks.len() as u64;
     for block in blocks {
         let block = block.unwrap();
+        let block_num = block.header.unwrap().height as u64;
         for tx in block.data.unwrap().txs {
-            tx_counter += 1;
-
             let raw_tx_any = prost_types::Any {
                 type_url: "/cosmos.tx.v1beta1.TxRaw".to_string(),
                 value: tx,
             };
             let tx_raw: TxRaw = decode_any(raw_tx_any).unwrap();
-            let tx_hash = sha256::digest_bytes(&tx_raw.body_bytes);
+            let _tx_hash = sha256::digest(&tx_raw.body_bytes);
             let body_any = prost_types::Any {
                 type_url: "/cosmos.tx.v1beta1.TxBody".to_string(),
                 value: tx_raw.body_bytes,
             };
             let tx_body: TxBody = decode_any(body_any).unwrap();
             for message in tx_body.messages {
-                msg_counter += 1;
-                let ibc_transfer_any = prost_types::Any {
-                    type_url: "/cosmos.bank.v1beta1.MsgSend".to_string(),
-                    value: message.value,
-                };
-                let ibc_transfer: Result<MsgSend, _> = decode_any(ibc_transfer_any);
-
-                if let Ok(decoded_transfer) = ibc_transfer {
-                    if decoded_transfer.from_address == "althea15np5r0cfcemug4azyewc8un8dtd7kk9kkr33c0".to_string() {
-                        println!("{}", decoded_transfer.to_address);
+                println!("got message of type {}", message.type_url);
+                match message.type_url.as_str() {
+                    "/cosmos.bank.v1beta1.MsgSend" => {
+                        let send = decode_msg_send(message).unwrap();
+                        let source_address: Address = send.from_address.parse().unwrap();
+                        let destination_address: Address = send.to_address.parse().unwrap();
+                        if source_address == target_address || destination_address == target_address
+                        {
+                            let txs = txs.entry(block_num).or_insert_with(Vec::new);
+                            txs.push(MessageWrapper::Send(send));
+                        }
+                    }
+                    "/cosmos.distribution.v1beta1.MsgWithdrawDelegatorReward" => {
+                        let reward = decode_msg_withdraw_delegator_reward(message).unwrap();
+                        let delegator_address: Address = reward.delegator_address.parse().unwrap();
+                        if delegator_address == target_address {
+                            let txs = txs.entry(block_num).or_insert_with(Vec::new);
+                            txs.push(MessageWrapper::Reward(reward));
+                        }
+                    }
+                    "/cosmos.staking.v1beta1.MsgDelegate" => {
+                        let delegate = decode_msg_delegate(message).unwrap();
+                        let delegator_address: Address =
+                            delegate.delegator_address.parse().unwrap();
+                        if delegator_address == target_address {
+                            let txs = txs.entry(block_num).or_insert_with(Vec::new);
+                            txs.push(MessageWrapper::Delegate(delegate));
+                        }
+                    }
+                    "/cosmos.staking.v1beta1.MsgUnDelegate" => {
+                        let undelegate = decode_msg_undelegate(message).unwrap();
+                        let delegator_address: Address =
+                            undelegate.delegator_address.parse().unwrap();
+                        if delegator_address == target_address {
+                            let txs = txs.entry(block_num).or_insert_with(Vec::new);
+                            txs.push(MessageWrapper::UnDelegate(undelegate));
+                        }
+                    }
+                    "/ibc.applications.transfer.v1.MsgTransfer" => {}
+                    "/ibc.core.channel.v1.MsgRecvPacket" => {}
+                    // gb depoist, we will see one per validator, so we should de-duplicate
+                    // using the event nonce
+                    "/gravity.v1.MsgSendToCosmosClaim" => {}
+                    "/gravity.v1.MsgSendToEth" => {}
+                    _ => {
+                        println!("unknown message type {}", message.type_url);
                     }
                 }
             }
         }
     }
-    let mut c = COUNTER.write().unwrap();
-    c.blocks += blocks_len;
-    c.transactions += tx_counter;
-    c.msgs += msg_counter;
+    print!(
+        "Got batch of {} blocks, {} contain target messages \n",
+        blocks_len,
+        txs.len()
+    );
+    txs
+}
+
+/// Wrapper for messages that we expect and will decode
+enum MessageWrapper {
+    Send(MsgSend),
+    Reward(MsgWithdrawDelegatorReward),
+    Delegate(MsgDelegate),
+    UnDelegate(MsgUndelegate),
+}
+
+fn decode_msg_send(message: Any) -> Option<MsgSend> {
+    let send_any = prost_types::Any {
+        type_url: "/cosmos.bank.v1beta1.MsgSend".to_string(),
+        value: message.value,
+    };
+    let send: Result<MsgSend, _> = decode_any(send_any);
+    match send {
+        Ok(send) => Some(send),
+        Err(_) => None,
+    }
+}
+
+fn decode_msg_withdraw_delegator_reward(message: Any) -> Option<MsgWithdrawDelegatorReward> {
+    let reward_any = prost_types::Any {
+        type_url: "/cosmos.distribution.v1beta1.MsgWithdrawDelegatorReward".to_string(),
+        value: message.value,
+    };
+    let reward: Result<MsgWithdrawDelegatorReward, _> = decode_any(reward_any);
+    match reward {
+        Ok(reward) => Some(reward),
+        Err(_) => None,
+    }
+}
+
+fn decode_msg_delegate(message: Any) -> Option<MsgDelegate> {
+    let delegate_any = prost_types::Any {
+        type_url: "/cosmos.staking.v1beta1.MsgDelegate".to_string(),
+        value: message.value,
+    };
+    let delegate: Result<MsgDelegate, _> = decode_any(delegate_any);
+    match delegate {
+        Ok(delegate) => Some(delegate),
+        Err(_) => None,
+    }
+}
+
+fn decode_msg_undelegate(message: Any) -> Option<MsgUndelegate> {
+    let undelegate_any = prost_types::Any {
+        type_url: "/cosmos.staking.v1beta1.MsgUnDelegate".to_string(),
+        value: message.value,
+    };
+    let undelegate: Result<MsgUndelegate, _> = decode_any(undelegate_any);
+    match undelegate {
+        Ok(undelegate) => Some(undelegate),
+        Err(_) => None,
+    }
+}
+
+const DEFAULT_RPC: &str = "https://gravitychain.io:9090";
+
+/// Command line arguments
+#[derive(Parser)]
+#[clap(version = env!("CARGO_PKG_VERSION"), author = "Justin Kilpatrick <justin@althea.net>")]
+struct Opts {
+    /// Target account to generate a csv for
+    #[arg(short, long)]
+    target_account: Address,
+
+    /// rpc url to use
+    #[arg(short, long, default_value = DEFAULT_RPC)]
+    rpc: String,
 }
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
-    let contact = Contact::new("http://althea.zone:9090", TIMEOUT, "althea")
-        .expect("invalid url");
+    let args = Opts::parse();
+    let prefix = args.target_account.get_prefix();
+
+    let contact = Contact::new(&args.rpc, Duration::from_secs(5), &prefix).expect("invalid url");
 
     let status = contact
-        .get_chain_status()
+        .get_latest_block()
         .await
         .expect("Failed to get chain status, grpc error");
 
     // get the latest block this node has
     let latest_block = match status {
-        deep_space::client::ChainStatus::Moving { block_height } => block_height,
+        LatestBlock::Latest { block } | LatestBlock::Syncing { block } => {
+            block.header.unwrap().height as u64
+        }
         _ => panic!("Node is not synced or not running"),
     };
 
@@ -120,7 +227,7 @@ async fn main() {
     let start = Instant::now();
 
     const BATCH_SIZE: u64 = 500;
-    const EXECUTE_SIZE: usize = 200;
+    const EXECUTE_SIZE: usize = 5;
     let mut pos = earliest_block;
     let mut futures = Vec::new();
     while pos < latest_block {
@@ -132,7 +239,7 @@ async fn main() {
             pos = latest_block;
             latest_block
         };
-        let fut = search(&contact, start, end);
+        let fut = search(&contact, args.target_account, start, end);
         futures.push(fut);
     }
 
@@ -144,18 +251,18 @@ async fn main() {
             buf.push(fut);
         } else {
             let _ = join_all(buf).await;
-            println!("Completed batch of {} blocks", BATCH_SIZE * EXECUTE_SIZE as u64);
+            println!(
+                "Completed batch of {} blocks",
+                BATCH_SIZE * EXECUTE_SIZE as u64
+            );
             buf = Vec::new();
         }
     }
     let _ = join_all(buf).await;
 
-    let counter = COUNTER.read().unwrap();
+    let elapsed = start.elapsed();
     println!(
-        "Successfully downloaded {} blocks and {} tx containing {} messages in {} seconds",
-        counter.blocks,
-        counter.transactions,
-        counter.msgs,
-        start.elapsed().as_secs()
-    )
+        "Completed transaction scan and dump elapsed time: {:?}",
+        elapsed
+    );
 }
