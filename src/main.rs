@@ -333,8 +333,8 @@ async fn main() {
     );
     let start = Instant::now();
 
-    const BATCH_SIZE: u64 = 50;
-    const EXECUTE_SIZE: usize = 50;
+    const BATCH_SIZE: u64 = 1_000;
+    const EXECUTE_SIZE: usize = 250;
     let mut pos = earliest_block;
     let mut futures = Vec::new();
     while pos < latest_block {
