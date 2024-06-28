@@ -3,8 +3,8 @@ use cosmos_sdk_proto_althea::{
     cosmos::{
         bank::v1beta1::MsgSend,
         distribution::v1beta1::MsgWithdrawDelegatorReward,
-        staking::v1beta1::{MsgDelegate, MsgUndelegate},
-        tx::v1beta1::{TxBody, TxRaw},
+        staking::v1beta1::{AuthorizationType, MsgDelegate, MsgUndelegate},
+        tx::v1beta1::{AuthInfo, TxBody, TxRaw},
     },
     ibc::applications::transfer::v1::MsgTransfer,
 };
@@ -73,10 +73,10 @@ async fn search(contact: &Contact, target_address: Address, start: u64, end: u64
         for tx in block.data.unwrap().txs {
             let raw_tx_any = prost_types::Any {
                 type_url: "/cosmos.tx.v1beta1.TxRaw".to_string(),
-                value: tx,
+                value: tx.clone(),
             };
             let tx_raw: TxRaw = decode_any(raw_tx_any).unwrap();
-            let tx_hash = sha256::digest(&tx_raw.body_bytes);
+            let tx_hash = sha256::digest(tx);
             let body_any = prost_types::Any {
                 type_url: "/cosmos.tx.v1beta1.TxBody".to_string(),
                 value: tx_raw.body_bytes,
