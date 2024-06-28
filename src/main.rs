@@ -6,7 +6,7 @@ use cosmos_sdk_proto_althea::{
         staking::v1beta1::{MsgDelegate, MsgUndelegate},
         tx::v1beta1::{TxBody, TxRaw},
     },
-    ibc::{applications::transfer::v1::MsgTransfer, core::channel::v1::MsgRecvPacket},
+    ibc::applications::transfer::v1::MsgTransfer,
 };
 use csv::Writer;
 use deep_space::{address::Address, Coin};
@@ -177,7 +177,7 @@ async fn search(contact: &Contact, target_address: Address, start: u64, end: u64
                                     && event.attributes[2].value == target_address.to_string()
                                 {
                                     let txs = txs.entry(block_num).or_insert_with(Vec::new);
-                                    let mut amount = Coin {
+                                    let amount = Coin {
                                         denom: event.attributes[3].key.clone(),
                                         amount: event.attributes[3].value.parse().unwrap(),
                                     };
