@@ -388,6 +388,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4b82cf0babdbd58558212896d1a4272303a57bdb245c2bf1147185fb45640e70"
 
 [[package]]
+name = "clarity"
+version = "1.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4cc231e36d58a7fc35e59d4177f5579428e3586992f93ebabeafb873ef89eb46"
+dependencies = [
+ "num-traits",
+ "num256",
+ "secp256k1",
+ "serde",
+ "serde_derive",
+ "sha3",
+]
+
+[[package]]
 name = "colorchoice"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -475,6 +489,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "clap",
+ "clarity",
  "cosmos-sdk-proto-althea",
  "csv",
  "deep_space",
@@ -494,6 +509,7 @@ dependencies = [
  "base64",
  "bech32",
  "bytes",
+ "clarity",
  "cosmos-sdk-proto-althea",
  "hmac",
  "log",
@@ -510,6 +526,7 @@ dependencies = [
  "serde_derive",
  "serde_json",
  "sha2",
+ "sha3",
  "tokio",
  "tonic",
  "unicode-normalization",
@@ -890,6 +907,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "29c15563dc2726973df627357ce0c9ddddbea194836909d655df6a75d2cf296d"
 dependencies = [
  "wasm-bindgen",
+]
+
+[[package]]
+name = "keccak"
+version = "0.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ecc2af9a1119c51f12a14607e783cb977bde58bc069ff0c3da1095e635d70654"
+dependencies = [
+ "cpufeatures",
 ]
 
 [[package]]
@@ -1443,6 +1469,16 @@ dependencies = [
  "hex",
  "sha2",
  "tokio",
+]
+
+[[package]]
+name = "sha3"
+version = "0.10.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "75872d278a8f37ef87fa0ddbda7802605cb18344497949862c0d4dcb291eba60"
+dependencies = [
+ "digest",
+ "keccak",
 ]
 
 [[package]]

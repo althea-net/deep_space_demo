@@ -148,7 +148,7 @@ async fn search(contact: &Contact, target_address: Address, start: u64, end: u64
                     MSG_TRANSFER => {
                         let transfer = decode_msg_transfer(message);
                         let sender: Result<Address, _> = transfer.sender.parse();
-                        let receiver: Result<Address, _> = transfer.receiver.parse();
+                        let receiver: Result<CosmosOrEthAddress, _> = transfer.receiver.parse();
                         if let (Ok(sender), Ok(reciver)) = (sender, receiver) {
                             if sender == target_address || reciver == target_address {
                                 let txs = txs.entry(block_num).or_insert_with(Vec::new);
@@ -210,8 +210,8 @@ async fn search(contact: &Contact, target_address: Address, start: u64, end: u64
                             }
                         } else {
                             println!(
-                                "Could not parse cosmos receiver {}",
-                                send_to_cosmos_claim.cosmos_receiver
+                                "Could not parse cosmos receiver {} for tx {}",
+                                send_to_cosmos_claim.cosmos_receiver, tx_hash
                             );
                         }
                     }
@@ -729,4 +729,60 @@ fn make_csv(input: SearchReturn) {
     wtr.flush().unwrap();
     let data = String::from_utf8(wtr.into_inner().unwrap()).unwrap();
     std::fs::write("output.csv", data).expect("Failed to write to file");
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CosmosOrEthAddress {
+    Cosmos(Address),
+    Eth(clarity::Address),
+}
+
+impl PartialEq<clarity::Address> for CosmosOrEthAddress {
+    fn eq(&self, other: &clarity::Address) -> bool {
+        match self {
+            CosmosOrEthAddress::Cosmos(_) => false,
+            CosmosOrEthAddress::Eth(address) => address == other,
+        }
+    }
+}
+
+impl PartialEq<Address> for CosmosOrEthAddress {
+    fn eq(&self, other: &Address) -> bool {
+        match self {
+            CosmosOrEthAddress::Cosmos(address) => address == other,
+            CosmosOrEthAddress::Eth(_) => false,
+        }
+    }
+}
+
+impl ToString for CosmosOrEthAddress {
+    fn to_string(&self) -> String {
+        match self {
+            CosmosOrEthAddress::Cosmos(address) => address.to_string(),
+            CosmosOrEthAddress::Eth(address) => address.to_string(),
+        }
+    }
+}
+
+impl std::str::FromStr for CosmosOrEthAddress {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let cosmos = s.parse::<Address>();
+        let eth = s.parse::<clarity::Address>();
+        match (cosmos, eth) {
+            (Ok(cosmos), _) => Ok(CosmosOrEthAddress::Cosmos(cosmos)),
+            (_, Ok(eth)) => Ok(CosmosOrEthAddress::Eth(eth)),
+            _ => Err("Failed to parse address".to_string()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn test_address_parse() {
+        let _address: CosmosOrEthAddress = "0x7d26486cce9ae2ba0eae4f1be92ac379690c723b".parse().unwrap();
+    }
 }
