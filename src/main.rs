@@ -3,8 +3,8 @@ use cosmos_sdk_proto_althea::{
     cosmos::{
         bank::v1beta1::MsgSend,
         distribution::v1beta1::MsgWithdrawDelegatorReward,
-        staking::v1beta1::{AuthorizationType, MsgDelegate, MsgUndelegate},
-        tx::v1beta1::{AuthInfo, TxBody, TxRaw},
+        staking::v1beta1::{MsgDelegate, MsgUndelegate},
+        tx::v1beta1::{TxBody, TxRaw},
     },
     ibc::applications::transfer::v1::MsgTransfer,
 };
@@ -64,7 +64,7 @@ async fn search(contact: &Contact, target_address: Address, start: u64, end: u64
     let mut txs = HashMap::new();
     let mut block_timestamps = HashMap::new();
 
-    let blocks_len = blocks.len() as u64;
+    let _blocks_len = blocks.len() as u64;
     for block in blocks {
         let block = block.unwrap();
         let block_num = block.header.clone().unwrap().height as u64;
@@ -215,11 +215,11 @@ async fn search(contact: &Contact, target_address: Address, start: u64, end: u64
             }
         }
     }
-    print!(
-        "Got batch of {} blocks, {} contain target messages \n",
-        blocks_len,
-        txs.len()
-    );
+    // println!(
+    //     "Got batch of {} blocks, {} contain target messages \n",
+    //     blocks_len,
+    //     txs.len()
+    // );
     SearchReturn {
         messages: txs,
         block_timestamps,
@@ -346,6 +346,24 @@ fn merge_search_results(search_results: Vec<SearchReturn>) -> SearchReturn {
     }
 }
 
+fn format_duration_long(duration: Duration) -> String {
+    let total_seconds = duration.as_secs();
+    let days = total_seconds / 86400;
+    let hours = (total_seconds % 86400) / 3600;
+    let minutes = (total_seconds % 3600) / 60;
+    let seconds = total_seconds % 60;
+
+    format!("{}d {}h {}m {}s", days, hours, minutes, seconds)
+}
+
+fn format_duration_short(duration: Duration) -> String {
+    let total_seconds = duration.as_millis();
+    let seconds = total_seconds / 1000;
+    let ms = total_seconds % 1000;
+
+    format!("{}s {}ms", seconds, ms)
+}
+
 /// Downloads blocks and processes transactions in batches.
 ///
 /// # Arguments
@@ -390,17 +408,40 @@ async fn download_and_process_blocks(
         block_timestamps: HashMap::new(),
     };
     let mut buf = Vec::new();
+    let mut start = Instant::now();
+    // this is used to compute the average time per batch in an amortized way
+    // we sum the total time constantly into this duration, then divide by how
+    // many batches we have processed so far to get the average time per batch
+    let mut total_execution_time_so_far = Duration::new(0, 0);
+    let mut total_batches_completed_so_far = 0;
     while let Some(fut) = futures.next() {
         if buf.len() < execute_size {
             buf.push(fut);
         } else {
+            // run many futures in parallel to download blocks and parse
             let res = join_all(buf).await;
+            // merge each result into the total collection of transactions
+            // first merge this batch, then merge that into the total
             let batch_merged = merge_search_results(res);
             merged = merge_search_results(vec![merged, batch_merged]);
+            // how many blocks we processed this round
+            let total_processed = batch_size * execute_size as u64;
+            let batches_remaining = futures.len() / execute_size;
+            // estimate how long this will take to finish using the average time per batch
+            total_execution_time_so_far += start.elapsed();
+            total_batches_completed_so_far += 1;
+            let estimated_remaining = (total_execution_time_so_far
+                / total_batches_completed_so_far)
+                * batches_remaining as u32;
+            // log information
             println!(
-                "Completed batch of {} blocks",
-                batch_size * execute_size as u64
+                "Completed batch of {} blocks in {} ETA {}",
+                total_processed,
+                format_duration_short(start.elapsed()),
+                format_duration_long(estimated_remaining)
             );
+
+            start = Instant::now();
             buf = Vec::new();
         }
     }
