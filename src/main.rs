@@ -646,23 +646,42 @@ const TOKEN_MAPPINGS: &[(&str, &str, u32)] = &[
     ),
     (
         "gravity0x92D6C1e31e14520e676a687F0a93788B716BEff5",
-        "WTAO",
+        "DYDX",
         18,
     ),
-    ("gravty0xA0b73E1Ff0B80914AB6fe0444E65848C4C34450b", "CRO", 8),
     (
-        "gravty0xa47c8bf37f92aBed4A126BDA807A7b7498661acD",
+        "gravity0xA0b73E1Ff0B80914AB6fe0444E65848C4C34450b",
+        "CRO",
+        8,
+    ),
+    (
+        "gravity0xa47c8bf37f92aBed4A126BDA807A7b7498661acD",
         "USTC",
         18,
     ),
     (
-        "gravty0xc0a4Df35568F116C370E6a6A6022Ceb908eedDaC",
+        "gravity0xc0a4Df35568F116C370E6a6A6022Ceb908eedDaC",
         "UMEE",
         6,
     ),
     (
+        "gravity0xaea46A60368A7bD060eec7DF8CBa43b7EF41Ad85",
+        "FET",
+        18,
+    ),
+    (
+        "gravity0xe28b3B32B6c345A34Ff64674606124Dd5Aceca30",
+        "INJ",
+        18,
+    ),
+    (
         "ibc/AD355DD10DF3C25CD42B5812F34077A1235DF343ED49A633B4E76AE98F3B78BC",
         "USK",
+        6,
+    ),
+    (
+        "ibc/3DA3455A6E8EBE1C7EF5C83FDED825B94C13A9303A7FA54C098F13A091B00CE1",
+        "UAQLA",
         6,
     ),
     (
