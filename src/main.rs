@@ -110,6 +110,7 @@ async fn search(contact: &Contact, target_address: Address, start: u64, end: u64
                                 }
                             };
                             let mut amounts = Vec::new();
+                            let mut found = false;
                             for log in tx {
                                 for event in log.events {
                                     if event.r#type == "coin_received"
@@ -119,16 +120,24 @@ async fn search(contact: &Contact, target_address: Address, start: u64, end: u64
                                         for coin in event.attributes[1].value.split(',') {
                                             amounts.push(coin.parse().unwrap());
                                         }
+                                        found = true;
                                         // there are multiple instances of coin_received in the logs for some reason
                                         break;
                                     }
+                                }
+                                // we don't want to process other logs in this message, they will be duplicates
+                                if found {
+                                    break;
                                 }
                             }
                             txs.push(MessageWrapper::Reward {
                                 validator: reward.validator_address.parse().unwrap(),
                                 delegator: delegator_address,
                                 amounts,
-                            })
+                            });
+                            // staking reward claims are normally bunded several to a tx, but the log is printed
+                            // once per claim, so if we keep looping we will just get duplicates
+                            break;
                         }
                     }
                     MSG_DELEGATE => {
@@ -188,6 +197,7 @@ async fn search(contact: &Contact, target_address: Address, start: u64, end: u64
                                     && event.attributes[2].value == target_address.to_string()
                                 {
                                     let txs = txs.entry(block_num).or_insert_with(Vec::new);
+                                    println!("{:?}", event.attributes[3]);
                                     let amount = Coin {
                                         denom: event.attributes[3].key.clone(),
                                         amount: event.attributes[3].value.parse().unwrap(),
@@ -600,9 +610,80 @@ const TOKEN_MAPPINGS: &[(&str, &str, u32)] = &[
         6,
     ),
     (
+        "gravity0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599",
+        "WBTC",
+        8,
+    ),
+    (
+        "gravity0x45804880De22913dAFE09f4980848ECE6EcbAf78",
+        "PAXG",
+        18,
+    ),
+    (
+        "gravity0x514910771AF9Ca656af840dff83E8264EcF986CA",
+        "LINK",
+        18,
+    ),
+    (
+        "gravity0x6B175474E89094C44Da98b954EedeAC495271d0F",
+        "DAI",
+        18,
+    ),
+    (
         "gravity0xfB5c6815cA3AC72Ce9F5006869AE67f18bF77006",
         "PSTAKE",
         18,
+    ),
+    (
+        "gravity0x60e683C6514Edd5F758A55b6f393BeBBAfaA8d5e",
+        "PAGE",
+        8,
+    ),
+    (
+        "gravity0x77E06c9eCCf2E797fd462A92B6D7642EF85b0A44",
+        "WTAO",
+        9,
+    ),
+    (
+        "gravity0x92D6C1e31e14520e676a687F0a93788B716BEff5",
+        "WTAO",
+        18,
+    ),
+    ("gravty0xA0b73E1Ff0B80914AB6fe0444E65848C4C34450b", "CRO", 8),
+    (
+        "gravty0xa47c8bf37f92aBed4A126BDA807A7b7498661acD",
+        "USTC",
+        18,
+    ),
+    (
+        "gravty0xc0a4Df35568F116C370E6a6A6022Ceb908eedDaC",
+        "UMEE",
+        6,
+    ),
+    (
+        "ibc/AD355DD10DF3C25CD42B5812F34077A1235DF343ED49A633B4E76AE98F3B78BC",
+        "USK",
+        6,
+    ),
+    (
+        "ibc/97275C664907DF6ADEA732934510F64D0B4EB89886E4DC912AA27A24025E78CD",
+        "NEUTARO",
+        6,
+    ),
+    (
+        "ibc/4F393C3FCA4190C0A6756CE7F6D897D5D1BE57D6CCB80D0BC87393566A7B6602",
+        "STARS",
+        6,
+    ),
+    (
+        "ibc/6BEE6DBC35E5CCB3C8ADA943CF446735E6A3D48B174FEE027FAB3410EDE6319C",
+        "KUJI",
+        6,
+    ),
+    (
+        "ibc/2E5D0AC026AC1AFA65A23023BA4F24BB8DDF94F118EDC0BAD6F625BFC557CDED",
+        "ATOM",
+        6,
     ),
     (
         "ibc/0C273962C274B2C05B22D9474BFE5B84D6A6FCAD198CB9B0ACD35EA521A36606",
@@ -705,8 +786,8 @@ fn make_csv(input: SearchReturn, target_address: Address) {
                             wtr.write_record(&[
                                 block.to_string(),
                                 formatted_timestamp.clone(),
-                                validator.to_string(),
                                 delegator.to_string(),
+                                validator.to_string(),
                                 "WithdrawStakingReward".to_string(),
                                 translated_coin.denom.clone(),
                                 translated_coin.amount.to_string().clone(),
@@ -771,14 +852,18 @@ fn make_csv(input: SearchReturn, target_address: Address) {
                         .unwrap();
                     }
                     MessageWrapper::SendToCosmosClaim(msg) => {
+                        let translated_coin = translate_coin(Coin {
+                            denom: format!("gravity{}", msg.token_contract.clone()),
+                            amount: msg.amount.clone().parse().unwrap(),
+                        });
                         wtr.write_record(&[
                             block.to_string(),
                             formatted_timestamp.clone(),
                             msg.cosmos_receiver.clone(),
                             msg.ethereum_sender.clone(),
                             "SendToGravity".to_string(),
-                            msg.token_contract.clone(),
-                            msg.amount.clone(),
+                            translated_coin.denom.clone(),
+                            translated_coin.amount.to_string(),
                         ])
                         .unwrap();
                     }
