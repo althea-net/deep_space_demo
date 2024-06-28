@@ -20,3 +20,4 @@ futures = "0.3"
 sha256 = "1"
 prost-types ="0.12"
 clap = {version="4", features=["derive"]}
+csv = "1.3"

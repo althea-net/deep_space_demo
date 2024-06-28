@@ -8,6 +8,7 @@ use cosmos_sdk_proto_althea::{
     },
     ibc::{applications::transfer::v1::MsgTransfer, core::channel::v1::MsgRecvPacket},
 };
+use csv::Writer;
 use deep_space::address::Address;
 use deep_space::{
     client::{types::LatestBlock, Contact},
@@ -15,14 +16,21 @@ use deep_space::{
 };
 use futures::future::join_all;
 use gravity_proto::gravity::{MsgSendToCosmosClaim, MsgSendToEth};
-use prost_types::Any;
+use prost_types::{Any, Timestamp};
 use std::{
-    collections::HashMap,
-    time::{Duration, Instant},
-    vec,
+    collections::HashMap, time::{Duration, Instant}, vec
 };
 
 const TIMEOUT: Duration = Duration::from_secs(60);
+
+const MSG_SEND: &str = "/cosmos.bank.v1beta1.MsgSend";
+const MSG_WITHDRAW_REWARD: &str = "/cosmos.distribution.v1beta1.MsgWithdrawDelegatorReward";
+const MSG_DELEGATE: &str = "/cosmos.staking.v1beta1.MsgDelegate";
+const MSG_UNDELEGATE: &str = "/cosmos.staking.v1beta1.MsgUndelegate";
+const MSG_TRANSFER: &str = "/ibc.applications.transfer.v1.MsgTransfer";
+const MSG_RECV_PACKET: &str = "/ibc.core.channel.v1.MsgRecvPacket";
+const MSG_SEND_TO_COSMOS_CLAIM: &str = "/gravity.v1.MsgSendToCosmosClaim";
+const MSG_SEND_TO_ETH: &str = "/gravity.v1.MsgSendToEth";
 
 /// finds earliest available block using binary search, keep in mind this cosmos
 /// node will not have history from chain halt upgrades and could be state synced
@@ -42,6 +50,11 @@ async fn get_earliest_block(contact: &Contact, mut start: u64, mut end: u64) -> 
     start + 1
 }
 
+pub struct SearchReturn {
+    messages: HashMap<u64, Vec<MessageWrapper>>,
+    block_timestamps: HashMap<u64, Timestamp>,
+}
+
 /// Searches a segment of blocks for transactions to or from a target address
 /// returns a Hashmap of transactions indexed by block height
 async fn search(
@@ -49,14 +62,17 @@ async fn search(
     target_address: Address,
     start: u64,
     end: u64,
-) -> HashMap<u64, Vec<MessageWrapper>> {
+) -> SearchReturn {
     let blocks = contact.get_block_range(start, end).await.unwrap();
     let mut txs = HashMap::new();
+    let mut block_timestamps = HashMap::new();
 
     let blocks_len = blocks.len() as u64;
     for block in blocks {
         let block = block.unwrap();
-        let block_num = block.header.unwrap().height as u64;
+        let block_num = block.header.clone().unwrap().height as u64;
+        let block_timestamp = block.header.unwrap().time.unwrap();
+        block_timestamps.insert(block_num, block_timestamp);
         for tx in block.data.unwrap().txs {
             let raw_tx_any = prost_types::Any {
                 type_url: "/cosmos.tx.v1beta1.TxRaw".to_string(),
@@ -71,8 +87,8 @@ async fn search(
             let tx_body: TxBody = decode_any(body_any).unwrap();
             for message in tx_body.messages {
                 match message.type_url.as_str() {
-                    "/cosmos.bank.v1beta1.MsgSend" => {
-                        let send = decode_msg_send(message).unwrap();
+                    MSG_SEND => {
+                        let send = decode_msg_send(message);
                         let source_address: Address = send.from_address.parse().unwrap();
                         let destination_address: Address = send.to_address.parse().unwrap();
                         if source_address == target_address || destination_address == target_address
@@ -81,16 +97,16 @@ async fn search(
                             txs.push(MessageWrapper::Send(send));
                         }
                     }
-                    "/cosmos.distribution.v1beta1.MsgWithdrawDelegatorReward" => {
-                        let reward = decode_msg_withdraw_delegator_reward(message).unwrap();
+                    MSG_WITHDRAW_REWARD => {
+                        let reward = decode_msg_withdraw_delegator_reward(message);
                         let delegator_address: Address = reward.delegator_address.parse().unwrap();
                         if delegator_address == target_address {
                             let txs = txs.entry(block_num).or_insert_with(Vec::new);
                             txs.push(MessageWrapper::Reward(reward));
                         }
                     }
-                    "/cosmos.staking.v1beta1.MsgDelegate" => {
-                        let delegate = decode_msg_delegate(message).unwrap();
+                    MSG_DELEGATE => {
+                        let delegate = decode_msg_delegate(message);
                         let delegator_address: Address =
                             delegate.delegator_address.parse().unwrap();
                         if delegator_address == target_address {
@@ -98,8 +114,8 @@ async fn search(
                             txs.push(MessageWrapper::Delegate(delegate));
                         }
                     }
-                    "/cosmos.staking.v1beta1.MsgUndelegate" => {
-                        let undelegate = decode_msg_undelegate(message).unwrap();
+                    MSG_UNDELEGATE => {
+                        let undelegate = decode_msg_undelegate(message);
                         let delegator_address: Address =
                             undelegate.delegator_address.parse().unwrap();
                         if delegator_address == target_address {
@@ -107,8 +123,8 @@ async fn search(
                             txs.push(MessageWrapper::UnDelegate(undelegate));
                         }
                     }
-                    "/ibc.applications.transfer.v1.MsgTransfer" => {
-                        let transfer = decode_msg_transfer(message).unwrap();
+                    MSG_TRANSFER => {
+                        let transfer = decode_msg_transfer(message);
                         let sender: Address = transfer.sender.parse().unwrap();
                         let receiver: Address = transfer.receiver.parse().unwrap();
                         if sender == target_address || receiver == target_address {
@@ -116,15 +132,14 @@ async fn search(
                             txs.push(MessageWrapper::Transfer(transfer));
                         }
                     }
-                    "/ibc.core.channel.v1.MsgRecvPacket" => {
-                        let recv_packet = decode_msg_recv_packet(message).unwrap();
+                    MSG_RECV_PACKET => {
+                        let recv_packet = decode_msg_recv_packet(message);
                         //  TODO need to figure out how to decode this
                         let txs = txs.entry(block_num).or_insert_with(Vec::new);
                         txs.push(MessageWrapper::RecvPacket(recv_packet));
                     }
-                    "/gravity.v1.MsgSendToCosmosClaim" => {
-                        let send_to_cosmos_claim =
-                            decode_msg_send_to_cosmos_claim(message).unwrap();
+                    MSG_SEND_TO_COSMOS_CLAIM => {
+                        let send_to_cosmos_claim = decode_msg_send_to_cosmos_claim(message);
                         let destination_address: Address =
                             send_to_cosmos_claim.cosmos_receiver.parse().unwrap();
                         if destination_address == target_address {
@@ -132,8 +147,8 @@ async fn search(
                             txs.push(MessageWrapper::SendToCosmosClaim(send_to_cosmos_claim));
                         }
                     }
-                    "/gravity.v1.MsgSendToEth" => {
-                        let send_to_eth = decode_msg_send_to_eth(message).unwrap();
+                    MSG_SEND_TO_ETH => {
+                        let send_to_eth = decode_msg_send_to_eth(message);
                         let source_address: Address = send_to_eth.sender.parse().unwrap();
                         if source_address == target_address {
                             let txs = txs.entry(block_num).or_insert_with(Vec::new);
@@ -152,7 +167,10 @@ async fn search(
         blocks_len,
         txs.len()
     );
-    txs
+    SearchReturn {
+        messages: txs,
+        block_timestamps,
+    }
 }
 
 /// Wrapper for messages that we expect and will decode
@@ -167,114 +185,86 @@ enum MessageWrapper {
     SendToEth(MsgSendToEth),
 }
 
-fn decode_msg_send(message: Any) -> Option<MsgSend> {
+fn decode_msg_send(message: Any) -> MsgSend {
     let send_any = prost_types::Any {
-        type_url: "/cosmos.bank.v1beta1.MsgSend".to_string(),
+        type_url: MSG_SEND.to_string(),
         value: message.value,
     };
-    let send: Result<MsgSend, _> = decode_any(send_any);
-    match send {
-        Ok(send) => Some(send),
-        Err(_) => None,
-    }
+    decode_any(send_any).unwrap()
 }
 
-fn decode_msg_withdraw_delegator_reward(message: Any) -> Option<MsgWithdrawDelegatorReward> {
+fn decode_msg_withdraw_delegator_reward(message: Any) -> MsgWithdrawDelegatorReward {
     let reward_any = prost_types::Any {
-        type_url: "/cosmos.distribution.v1beta1.MsgWithdrawDelegatorReward".to_string(),
+        type_url: MSG_WITHDRAW_REWARD.to_string(),
         value: message.value,
     };
-    let reward: Result<MsgWithdrawDelegatorReward, _> = decode_any(reward_any);
-    match reward {
-        Ok(reward) => Some(reward),
-        Err(_) => None,
-    }
+    decode_any(reward_any).unwrap()
 }
 
-fn decode_msg_delegate(message: Any) -> Option<MsgDelegate> {
+fn decode_msg_delegate(message: Any) -> MsgDelegate {
     let delegate_any = prost_types::Any {
-        type_url: "/cosmos.staking.v1beta1.MsgDelegate".to_string(),
+        type_url: MSG_DELEGATE.to_string(),
         value: message.value,
     };
-    let delegate: Result<MsgDelegate, _> = decode_any(delegate_any);
-    match delegate {
-        Ok(delegate) => Some(delegate),
-        Err(_) => None,
-    }
+    decode_any(delegate_any).unwrap()
 }
 
-fn decode_msg_undelegate(message: Any) -> Option<MsgUndelegate> {
+fn decode_msg_undelegate(message: Any) -> MsgUndelegate {
     let undelegate_any = prost_types::Any {
-        type_url: "/cosmos.staking.v1beta1.MsgUndelegate".to_string(),
+        type_url: MSG_UNDELEGATE.to_string(),
         value: message.value,
     };
-    let undelegate: Result<MsgUndelegate, _> = decode_any(undelegate_any);
-    match undelegate {
-        Ok(undelegate) => Some(undelegate),
-        Err(_) => None,
-    }
+    decode_any(undelegate_any).unwrap()
 }
 
-fn decode_msg_transfer(message: Any) -> Option<MsgTransfer> {
+fn decode_msg_transfer(message: Any) -> MsgTransfer {
     let transfer_any = prost_types::Any {
-        type_url: "/ibc.applications.transfer.v1.MsgTransfer".to_string(),
+        type_url: MSG_TRANSFER.to_string(),
         value: message.value,
     };
-    let transfer: Result<MsgTransfer, _> = decode_any(transfer_any);
-    match transfer {
-        Ok(transfer) => Some(transfer),
-        Err(_) => None,
-    }
+    decode_any(transfer_any).unwrap()
 }
 
-fn decode_msg_recv_packet(message: Any) -> Option<MsgRecvPacket> {
+fn decode_msg_recv_packet(message: Any) -> MsgRecvPacket {
     let recv_packet_any = prost_types::Any {
-        type_url: "/ibc.core.channel.v1.MsgRecvPacket".to_string(),
+        type_url: MSG_RECV_PACKET.to_string(),
         value: message.value,
     };
-    let recv_packet: Result<MsgRecvPacket, _> = decode_any(recv_packet_any);
-    match recv_packet {
-        Ok(recv_packet) => Some(recv_packet),
-        Err(_) => None,
-    }
+    decode_any(recv_packet_any).unwrap()
 }
 
-fn decode_msg_send_to_cosmos_claim(message: Any) -> Option<MsgSendToCosmosClaim> {
+fn decode_msg_send_to_cosmos_claim(message: Any) -> MsgSendToCosmosClaim {
     let send_to_cosmos_claim_any = prost_types::Any {
-        type_url: "/gravity.v1.MsgSendToCosmosClaim".to_string(),
+        type_url: MSG_SEND_TO_COSMOS_CLAIM.to_string(),
         value: message.value,
     };
-    let send_to_cosmos_claim: Result<MsgSendToCosmosClaim, _> =
-        decode_any(send_to_cosmos_claim_any);
-    match send_to_cosmos_claim {
-        Ok(send_to_cosmos_claim) => Some(send_to_cosmos_claim),
-        Err(_) => None,
-    }
+    decode_any(send_to_cosmos_claim_any).unwrap()
 }
 
-fn decode_msg_send_to_eth(message: Any) -> Option<MsgSendToEth> {
+fn decode_msg_send_to_eth(message: Any) -> MsgSendToEth {
     let send_to_eth_any = prost_types::Any {
-        type_url: "/gravity.v1.MsgSendToEth".to_string(),
+        type_url: MSG_SEND_TO_ETH.to_string(),
         value: message.value,
     };
-    let send_to_eth: Result<MsgSendToEth, _> = decode_any(send_to_eth_any);
-    match send_to_eth {
-        Ok(send_to_eth) => Some(send_to_eth),
-        Err(_) => None,
-    }
+    decode_any(send_to_eth_any).unwrap()
 }
 
 fn merge_search_results(
-    search_results: Vec<HashMap<u64, Vec<MessageWrapper>>>,
-) -> HashMap<u64, Vec<MessageWrapper>> {
+    search_results: Vec<SearchReturn>,
+) -> SearchReturn {
     let mut merged = HashMap::new();
+    let mut block_timestamps = HashMap::new();
     for search_result in search_results {
-        for (block_num, messages) in search_result {
+        for (block_num, messages) in search_result.messages {
             let merged_messages = merged.entry(block_num).or_insert_with(Vec::new);
             merged_messages.extend(messages);
         }
+        block_timestamps.extend(search_result.block_timestamps);
     }
-    merged
+    SearchReturn {
+        messages: merged,
+        block_timestamps,
+    }
 }
 
 const DEFAULT_RPC: &str = "https://gravitychain.io:9090";
@@ -341,7 +331,10 @@ async fn main() {
     let mut futures = futures.into_iter();
 
     // we merge all the messages into this one hashmap
-    let mut merged = HashMap::new();
+    let mut merged = SearchReturn {
+        messages: HashMap::new(),
+        block_timestamps: HashMap::new(),
+    };
     let mut buf = Vec::new();
     while let Some(fut) = futures.next() {
         if buf.len() < EXECUTE_SIZE {
@@ -361,9 +354,9 @@ async fn main() {
 
     // the final storage of all target messages we have found
     let final_merged = merge_search_results(vec![merged, merge_search_results(res)]);
-    
-    // now we make a csv of the resulting messages
 
+    // now we make a csv of the resulting messages
+    make_csv(final_merged);
 
     let elapsed = start.elapsed();
     println!(
@@ -373,6 +366,118 @@ async fn main() {
 }
 
 /// Takes the combined user messages, creates a csv file with the following columns
-fn make_csv(input: HashMap<u64, Vec<MessageWrapper>>) {
+fn make_csv(input: SearchReturn) {
+    let mut wtr = Writer::from_writer(vec![]);
+    wtr.write_record(&[
+        "Block",
+        "Transaction To",
+        "Transaction From",
+        "Type",
+        "Token Type",
+        "Amount",
+    ])
+    .unwrap();
 
+    let mut blocks: Vec<_> = input.messages.keys().cloned().collect();
+    blocks.sort();
+
+    for block in blocks {
+        if let Some(messages) = input.messages.get(&block) {
+            for message in messages {
+                match message {
+                    MessageWrapper::Send(msg) => {
+                        wtr.write_record(&[
+                            block.to_string(),
+                            msg.to_address.clone(),
+                            msg.from_address.clone(),
+                            "Send".to_string(),
+                            msg.amount[0].denom.clone(),
+                            msg.amount[0].amount.clone(),
+                        ])
+                        .unwrap();
+                    }
+                    MessageWrapper::Reward(msg) => {
+                        wtr.write_record(&[
+                            block.to_string(),
+                            msg.validator_address.clone(),
+                            msg.delegator_address.clone(),
+                            "WithdrawReward".to_string(),
+                            "".to_string(),
+                            "".to_string(),
+                        ])
+                        .unwrap();
+                    }
+                    MessageWrapper::Delegate(msg) => {
+                        wtr.write_record(&[
+                            block.to_string(),
+                            msg.delegator_address.clone(),
+                            msg.validator_address.clone(),
+                            "Delegate".to_string(),
+                            msg.amount.as_ref().unwrap().denom.clone(),
+                            msg.amount.as_ref().unwrap().amount.clone(),
+                        ])
+                        .unwrap();
+                    }
+                    MessageWrapper::UnDelegate(msg) => {
+                        wtr.write_record(&[
+                            block.to_string(),
+                            msg.validator_address.clone(),
+                            msg.delegator_address.clone(),
+                            msg.amount.as_ref().unwrap().denom.clone(),
+                            msg.amount.as_ref().unwrap().amount.clone(),
+                        ])
+                        .unwrap();
+                    }
+                    MessageWrapper::Transfer(msg) => {
+                        wtr.write_record(&[
+                            block.to_string(),
+                            msg.receiver.clone(),
+                            msg.sender.clone(),
+                            "Transfer".to_string(),
+                            msg.token.as_ref().unwrap().denom.clone(),
+                            msg.token.as_ref().unwrap().amount.clone(),
+                        ])
+                        .unwrap();
+                    }
+                    MessageWrapper::RecvPacket(_) => {
+                        wtr.write_record(&[
+                            block.to_string(),
+                            "".to_string(),
+                            "".to_string(),
+                            "RecvPacket".to_string(),
+                            "".to_string(),
+                            "".to_string(),
+                        ])
+                        .unwrap();
+                    }
+                    MessageWrapper::SendToCosmosClaim(msg) => {
+                        wtr.write_record(&[
+                            block.to_string(),
+                            msg.cosmos_receiver.clone(),
+                            "".to_string(),
+                            "SendToCosmosClaim".to_string(),
+                            "".to_string(),
+                            "".to_string(),
+                        ])
+                        .unwrap();
+                    }
+                    MessageWrapper::SendToEth(msg) => {
+                        wtr.write_record(&[
+                            block.to_string(),
+                            msg.eth_dest.clone(),
+                            msg.sender.clone(),
+                            "SendToEth".to_string(),
+                            msg.amount.clone().unwrap().denom.clone(),
+                            msg.amount.clone().unwrap().amount.clone(),
+                        ])
+                        .unwrap();
+                    }
+                }
+            }
+        }
+    }
+
+    wtr.flush().unwrap();
+    let data = String::from_utf8(wtr.into_inner().unwrap()).unwrap();
+    std::fs::write("output.csv", data).expect("Failed to write to file");
 }
