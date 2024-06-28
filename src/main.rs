@@ -200,11 +200,19 @@ async fn search(contact: &Contact, target_address: Address, start: u64, end: u64
                     }
                     MSG_SEND_TO_COSMOS_CLAIM => {
                         let send_to_cosmos_claim = decode_msg_send_to_cosmos_claim(message);
-                        let destination_address: Address =
-                            send_to_cosmos_claim.cosmos_receiver.parse().unwrap();
-                        if destination_address == target_address {
-                            let txs = txs.entry(block_num).or_insert_with(Vec::new);
-                            txs.push(MessageWrapper::SendToCosmosClaim(send_to_cosmos_claim));
+                        if let Ok(destination_address) =
+                            send_to_cosmos_claim.cosmos_receiver.parse()
+                        {
+                            let destination_address: Address = destination_address;
+                            if destination_address == target_address {
+                                let txs = txs.entry(block_num).or_insert_with(Vec::new);
+                                txs.push(MessageWrapper::SendToCosmosClaim(send_to_cosmos_claim));
+                            }
+                        } else {
+                            println!(
+                                "Could not parse cosmos receiver {}",
+                                send_to_cosmos_claim.cosmos_receiver
+                            );
                         }
                     }
                     MSG_SEND_TO_ETH => {
