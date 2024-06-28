@@ -102,13 +102,13 @@ async fn search(contact: &Contact, target_address: Address, start: u64, end: u64
                             // the tx itself doesn't contain any info about what tokens we get as a reward, this requires on chain
                             // computation which is only displayed as a result in the logs, so we need to query the tx to get the logs
                             // and use those logs to compute what tokens where recieved.
-                            let tx = contact
-                                .get_tx_by_hash(tx_hash.clone())
-                                .await
-                                .unwrap()
-                                .tx_response
-                                .unwrap()
-                                .logs;
+                            let tx = match contact.get_tx_by_hash(tx_hash.clone()).await {
+                                Ok(t) => t.tx_response.unwrap().logs,
+                                Err(_) => {
+                                    println!("Failed to find tx by hash this represents an indexing error on your node! {}", tx_hash);
+                                    continue;
+                                }
+                            };
                             let mut amounts = Vec::new();
                             for log in tx {
                                 for event in log.events {
@@ -165,13 +165,13 @@ async fn search(contact: &Contact, target_address: Address, start: u64, end: u64
                         // the tx itself doesn't contain any info about what tokens we have recieved via ibc or the sender
                         // this requires on chain computation which is only displayed as a result in the logs, so we need to query the tx to get the logs
                         // in this case we must first make sure the tx is a send packet to us, then we must check the logs for the amount
-                        let tx = contact
-                            .get_tx_by_hash(tx_hash.clone())
-                            .await
-                            .unwrap()
-                            .tx_response
-                            .unwrap()
-                            .logs;
+                        let tx = match contact.get_tx_by_hash(tx_hash.clone()).await {
+                            Ok(t) => t.tx_response.unwrap().logs,
+                            Err(_) => {
+                                println!("Failed to find tx by hash this represents an indexing error on your node! {}", tx_hash);
+                                continue;
+                            }
+                        };
                         for log in tx {
                             for event in log.events {
                                 if event.r#type == "fungible_token_packet"
