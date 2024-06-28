@@ -359,6 +359,18 @@ struct Opts {
     /// rpc url to use
     #[arg(short, long, default_value = DEFAULT_RPC)]
     rpc: String,
+
+    /// How many blocks a single thread requests
+    /// and processes before processing. Higer values increase
+    /// memory usage.
+    #[arg(short, long, default_value = "1000")]
+    batch_size: u64,
+
+    /// How many threads request batches of batch_size blocks
+    /// in parallel. Higher values increase memory usage and the
+    /// number of requests made to the node.
+    #[arg(short, long, default_value = "250")]
+    execute_size: usize,
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -390,14 +402,14 @@ async fn main() {
     );
     let start = Instant::now();
 
-    const BATCH_SIZE: u64 = 1_000;
-    const EXECUTE_SIZE: usize = 250;
+    let batch_size = args.batch_size;
+    let execute_size = args.execute_size;
     let mut pos = earliest_block;
     let mut futures = Vec::new();
     while pos < latest_block {
         let start = pos;
-        let end = if latest_block - pos > BATCH_SIZE {
-            pos += BATCH_SIZE;
+        let end = if latest_block - pos > batch_size {
+            pos += batch_size;
             pos
         } else {
             pos = latest_block;
@@ -416,7 +428,7 @@ async fn main() {
     };
     let mut buf = Vec::new();
     while let Some(fut) = futures.next() {
-        if buf.len() < EXECUTE_SIZE {
+        if buf.len() < execute_size {
             buf.push(fut);
         } else {
             let res = join_all(buf).await;
@@ -424,7 +436,7 @@ async fn main() {
             merged = merge_search_results(vec![merged, batch_merged]);
             println!(
                 "Completed batch of {} blocks",
-                BATCH_SIZE * EXECUTE_SIZE as u64
+                batch_size * execute_size as u64
             );
             buf = Vec::new();
         }
