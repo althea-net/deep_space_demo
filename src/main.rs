@@ -91,7 +91,10 @@ async fn search(contact: &Contact, target_address: Address, start: u64, end: u64
                         if source_address == target_address || destination_address == target_address
                         {
                             let txs = txs.entry(block_num).or_insert_with(Vec::new);
-                            txs.push(MessageWrapper::Send(send));
+                            txs.push(MessageWrapper::Send {
+                                send,
+                                txhash: tx_hash.clone(),
+                            });
                         }
                     }
                     MSG_WITHDRAW_REWARD => {
@@ -134,6 +137,7 @@ async fn search(contact: &Contact, target_address: Address, start: u64, end: u64
                                 validator: reward.validator_address.parse().unwrap(),
                                 delegator: delegator_address,
                                 amounts,
+                                txhash: tx_hash.clone(),
                             });
                             // staking reward claims are normally bunded several to a tx, but the log is printed
                             // once per claim, so if we keep looping we will just get duplicates
@@ -146,7 +150,10 @@ async fn search(contact: &Contact, target_address: Address, start: u64, end: u64
                             delegate.delegator_address.parse().unwrap();
                         if delegator_address == target_address {
                             let txs = txs.entry(block_num).or_insert_with(Vec::new);
-                            txs.push(MessageWrapper::Delegate(delegate));
+                            txs.push(MessageWrapper::Delegate {
+                                delegate,
+                                txhash: tx_hash.clone(),
+                            });
                         }
                     }
                     MSG_UNDELEGATE => {
@@ -155,7 +162,10 @@ async fn search(contact: &Contact, target_address: Address, start: u64, end: u64
                             undelegate.delegator_address.parse().unwrap();
                         if delegator_address == target_address {
                             let txs = txs.entry(block_num).or_insert_with(Vec::new);
-                            txs.push(MessageWrapper::UnDelegate(undelegate));
+                            txs.push(MessageWrapper::UnDelegate {
+                                undelegate,
+                                txhash: tx_hash.clone(),
+                            });
                         }
                     }
                     MSG_TRANSFER => {
@@ -165,7 +175,10 @@ async fn search(contact: &Contact, target_address: Address, start: u64, end: u64
                         if let (Ok(sender), Ok(reciver)) = (sender, receiver) {
                             if sender == target_address || reciver == target_address {
                                 let txs = txs.entry(block_num).or_insert_with(Vec::new);
-                                txs.push(MessageWrapper::Transfer(transfer));
+                                txs.push(MessageWrapper::Transfer {
+                                    transfer,
+                                    txhash: tx_hash.clone(),
+                                });
                             }
                         } else {
                             println!(
@@ -207,6 +220,7 @@ async fn search(contact: &Contact, target_address: Address, start: u64, end: u64
                                         sender,
                                         reciver: target_address,
                                         amount: amount,
+                                        txhash: tx_hash.clone(),
                                     });
                                 }
                             }
@@ -220,12 +234,16 @@ async fn search(contact: &Contact, target_address: Address, start: u64, end: u64
                             let destination_address: Address = destination_address;
                             if destination_address == target_address {
                                 let txs = txs.entry(block_num).or_insert_with(Vec::new);
-                                txs.push(MessageWrapper::SendToCosmosClaim(send_to_cosmos_claim));
+                                txs.push(MessageWrapper::SendToCosmosClaim {
+                                    claim: send_to_cosmos_claim,
+                                    txhash: tx_hash.clone(),
+                                });
                             }
                         } else {
                             println!(
                                 "Could not parse cosmos receiver {} for tx {}",
-                                send_to_cosmos_claim.cosmos_receiver, tx_hash
+                                send_to_cosmos_claim.cosmos_receiver,
+                                tx_hash.clone()
                             );
                         }
                     }
@@ -234,7 +252,10 @@ async fn search(contact: &Contact, target_address: Address, start: u64, end: u64
                         let source_address: Address = send_to_eth.sender.parse().unwrap();
                         if source_address == target_address {
                             let txs = txs.entry(block_num).or_insert_with(Vec::new);
-                            txs.push(MessageWrapper::SendToEth(send_to_eth));
+                            txs.push(MessageWrapper::SendToEth {
+                                send: send_to_eth,
+                                txhash: tx_hash.clone(),
+                            });
                         }
                     }
                     _ => {
@@ -257,22 +278,42 @@ async fn search(contact: &Contact, target_address: Address, start: u64, end: u64
 
 /// Wrapper for messages that we expect and will decode
 enum MessageWrapper {
-    Send(MsgSend),
+    Send {
+        send: MsgSend,
+        txhash: String,
+    },
     Reward {
         validator: Address,
         delegator: Address,
         amounts: Vec<Coin>,
+        txhash: String,
     },
-    Delegate(MsgDelegate),
-    UnDelegate(MsgUndelegate),
-    Transfer(MsgTransfer),
+    Delegate {
+        delegate: MsgDelegate,
+        txhash: String,
+    },
+    UnDelegate {
+        undelegate: MsgUndelegate,
+        txhash: String,
+    },
+    Transfer {
+        transfer: MsgTransfer,
+        txhash: String,
+    },
     RecvPacket {
         sender: Address,
         reciver: Address,
         amount: Coin,
+        txhash: String,
     },
-    SendToCosmosClaim(MsgSendToCosmosClaim),
-    SendToEth(MsgSendToEth),
+    SendToCosmosClaim {
+        claim: MsgSendToCosmosClaim,
+        txhash: String,
+    },
+    SendToEth {
+        send: MsgSendToEth,
+        txhash: String,
+    },
 }
 
 fn decode_msg_send(message: Any) -> MsgSend {
@@ -353,7 +394,7 @@ fn merge_search_results(search_results: Vec<SearchReturn>) -> SearchReturn {
         for (block_num, messages) in search_result.messages {
             let merged_messages = merged.entry(block_num).or_insert_with(Vec::new);
             for message in messages {
-                if let MessageWrapper::SendToCosmosClaim(claim) = &message {
+                if let MessageWrapper::SendToCosmosClaim { claim, .. } = &message {
                     if !cosmos_claims.contains(&claim.event_nonce) {
                         cosmos_claims.insert(claim.event_nonce);
                         merged_messages.push(message);
@@ -780,13 +821,14 @@ fn translate_coin<T: Into<Coin>>(coin: T) -> FractionalCoin {
 fn make_csv(input: SearchReturn, target_address: Address) {
     let mut wtr = Writer::from_writer(vec![]);
     wtr.write_record(&[
-        "Block",
         "Timestamp",
         "Transaction To",
         "Transaction From",
         "Type",
         "Token Type",
         "Amount",
+        "Block",
+        "TxHash",
     ])
     .unwrap();
 
@@ -802,16 +844,17 @@ fn make_csv(input: SearchReturn, target_address: Address) {
         if let Some(messages) = input.messages.get(&block) {
             for message in messages {
                 match message {
-                    MessageWrapper::Send(msg) => {
+                    MessageWrapper::Send { send: msg, txhash } => {
                         let translated_coin = translate_coin(msg.amount[0].clone());
                         wtr.write_record(&[
-                            block.to_string(),
                             formatted_timestamp.clone(),
                             msg.to_address.clone(),
                             msg.from_address.clone(),
                             "SendTokens".to_string(),
                             translated_coin.denom.clone(),
                             translated_coin.amount.to_string(),
+                            block.to_string(),
+                            txhash.clone(),
                         ])
                         .unwrap();
                     }
@@ -819,57 +862,71 @@ fn make_csv(input: SearchReturn, target_address: Address) {
                         validator,
                         delegator,
                         amounts,
+                        txhash,
                     } => {
                         for amount in amounts {
                             let translated_coin = translate_coin(amount.clone());
                             wtr.write_record(&[
-                                block.to_string(),
                                 formatted_timestamp.clone(),
                                 delegator.to_string(),
                                 validator.to_string(),
                                 "WithdrawStakingReward".to_string(),
                                 translated_coin.denom.clone(),
                                 translated_coin.amount.to_string().clone(),
+                                block.to_string(),
+                                txhash.clone(),
                             ])
                             .unwrap();
                         }
                     }
-                    MessageWrapper::Delegate(msg) => {
+                    MessageWrapper::Delegate {
+                        delegate: msg,
+                        txhash,
+                    } => {
                         let translated_coin = translate_coin(msg.clone().amount.unwrap());
                         wtr.write_record(&[
-                            block.to_string(),
                             formatted_timestamp.clone(),
                             msg.delegator_address.clone(),
                             msg.validator_address.clone(),
                             "Delegate".to_string(),
                             translated_coin.denom.clone(),
                             translated_coin.amount.to_string(),
+                            block.to_string(),
+                            txhash.clone(),
                         ])
                         .unwrap();
                     }
-                    MessageWrapper::UnDelegate(msg) => {
+                    MessageWrapper::UnDelegate {
+                        undelegate: msg,
+                        txhash,
+                    } => {
                         let translated_coin = translate_coin(msg.clone().amount.unwrap());
                         wtr.write_record(&[
-                            block.to_string(),
                             formatted_timestamp.clone(),
                             msg.validator_address.clone(),
                             msg.delegator_address.clone(),
                             "UnDelegate".to_string(),
                             translated_coin.denom.clone(),
                             translated_coin.amount.to_string(),
+                            block.to_string(),
+                            txhash.clone(),
                         ])
                         .unwrap();
                     }
-                    MessageWrapper::Transfer(msg) => {
+                    MessageWrapper::Transfer {
+                        transfer: msg,
+                        txhash,
+                    } => {
                         let translated_coin = translate_coin(msg.clone().token.unwrap());
                         wtr.write_record(&[
-                            block.to_string(),
                             formatted_timestamp.clone(),
                             msg.receiver.clone(),
                             msg.sender.clone(),
                             "IbcTransfer".to_string(),
                             translated_coin.denom.clone(),
                             translated_coin.amount.to_string(),
+                            block.to_string(),
+                            txhash.clone(),
                         ])
                         .unwrap();
                     }
@@ -877,45 +934,49 @@ fn make_csv(input: SearchReturn, target_address: Address) {
                         sender,
                         reciver,
                         amount,
+                        txhash,
                     } => {
                         let translated_coin = translate_coin(amount.clone());
                         wtr.write_record(&[
-                            block.to_string(),
                             formatted_timestamp.clone(),
                             reciver.to_string(),
                             sender.to_string(),
                             "IbcRecieve".to_string(),
                             translated_coin.denom.clone(),
                             translated_coin.amount.to_string(),
+                            block.to_string(),
+                            txhash.clone(),
                         ])
                         .unwrap();
                     }
-                    MessageWrapper::SendToCosmosClaim(msg) => {
+                    MessageWrapper::SendToCosmosClaim { claim: msg, txhash } => {
                         let translated_coin = translate_coin(Coin {
                             denom: format!("gravity{}", msg.token_contract.clone()),
                             amount: msg.amount.clone().parse().unwrap(),
                         });
                         wtr.write_record(&[
-                            block.to_string(),
                             formatted_timestamp.clone(),
                             msg.cosmos_receiver.clone(),
                             msg.ethereum_sender.clone(),
                             "SendToGravity".to_string(),
                             translated_coin.denom.clone(),
                             translated_coin.amount.to_string(),
+                            block.to_string(),
+                            txhash.clone(),
                         ])
                         .unwrap();
                     }
-                    MessageWrapper::SendToEth(msg) => {
+                    MessageWrapper::SendToEth { send: msg, txhash } => {
                         let translated_coin = translate_coin(msg.amount.clone().unwrap());
                         wtr.write_record(&[
-                            block.to_string(),
                             formatted_timestamp.clone(),
                             msg.eth_dest.clone(),
                             msg.sender.clone(),
                             "SendToEth".to_string(),
                             translated_coin.denom.clone(),
                             translated_coin.amount.to_string(),
+                            block.to_string(),
+                            txhash.clone(),
                         ])
                         .unwrap();
                     }
