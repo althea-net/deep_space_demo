@@ -147,11 +147,18 @@ async fn search(contact: &Contact, target_address: Address, start: u64, end: u64
                     }
                     MSG_TRANSFER => {
                         let transfer = decode_msg_transfer(message);
-                        let sender: Address = transfer.sender.parse().unwrap();
-                        let receiver: Address = transfer.receiver.parse().unwrap();
-                        if sender == target_address || receiver == target_address {
-                            let txs = txs.entry(block_num).or_insert_with(Vec::new);
-                            txs.push(MessageWrapper::Transfer(transfer));
+                        let sender: Result<Address, _> = transfer.sender.parse();
+                        let receiver: Result<Address, _> = transfer.receiver.parse();
+                        if let (Ok(sender), Ok(reciver)) = (sender, receiver) {
+                            if sender == target_address || reciver == target_address {
+                                let txs = txs.entry(block_num).or_insert_with(Vec::new);
+                                txs.push(MessageWrapper::Transfer(transfer));
+                            }
+                        } else {
+                            println!(
+                                "Could not parse ibc transfer sender {} or reciver {}",
+                                transfer.sender, transfer.receiver
+                            );
                         }
                     }
                     MSG_RECV_PACKET => {
