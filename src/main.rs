@@ -490,6 +490,11 @@ struct Opts {
     /// number of requests made to the node.
     #[arg(short, long, default_value = "250")]
     execute_size: usize,
+
+    /// Start at a specific block, useful for resuming a scan
+    /// Will error if the node does not have the specificed block
+    #[arg(short, long)]
+    start_at_block: Option<u64>,
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -513,7 +518,10 @@ async fn main() {
     };
 
     // now we find the earliest block this node has via binary search
-    let earliest_block = get_earliest_block(&contact, 0, latest_block).await;
+    let earliest_block = match args.start_at_block {
+        Some(block) => block,
+        None => get_earliest_block(&contact, 0, latest_block).await,
+    };
     println!(
         "This node has {} blocks to download, starting clock now",
         latest_block - earliest_block
