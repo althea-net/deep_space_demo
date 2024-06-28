@@ -18,7 +18,9 @@ use futures::future::join_all;
 use gravity_proto::gravity::{MsgSendToCosmosClaim, MsgSendToEth};
 use prost_types::{Any, Timestamp};
 use std::{
-    collections::HashMap, time::{Duration, Instant}, vec
+    collections::HashMap,
+    time::{Duration, Instant},
+    vec,
 };
 
 const TIMEOUT: Duration = Duration::from_secs(60);
@@ -57,12 +59,7 @@ pub struct SearchReturn {
 
 /// Searches a segment of blocks for transactions to or from a target address
 /// returns a Hashmap of transactions indexed by block height
-async fn search(
-    contact: &Contact,
-    target_address: Address,
-    start: u64,
-    end: u64,
-) -> SearchReturn {
+async fn search(contact: &Contact, target_address: Address, start: u64, end: u64) -> SearchReturn {
     let blocks = contact.get_block_range(start, end).await.unwrap();
     let mut txs = HashMap::new();
     let mut block_timestamps = HashMap::new();
@@ -133,10 +130,8 @@ async fn search(
                         }
                     }
                     MSG_RECV_PACKET => {
-                        let recv_packet = decode_msg_recv_packet(message);
-                        //  TODO need to figure out how to decode this
-                        let txs = txs.entry(block_num).or_insert_with(Vec::new);
-                        txs.push(MessageWrapper::RecvPacket(recv_packet));
+                        let _recv_packet = decode_msg_recv_packet(message);
+                        continue;
                     }
                     MSG_SEND_TO_COSMOS_CLAIM => {
                         let send_to_cosmos_claim = decode_msg_send_to_cosmos_claim(message);
@@ -249,23 +244,50 @@ fn decode_msg_send_to_eth(message: Any) -> MsgSendToEth {
     decode_any(send_to_eth_any).unwrap()
 }
 
-fn merge_search_results(
-    search_results: Vec<SearchReturn>,
-) -> SearchReturn {
+/// Merges multiple `SearchReturn` instances into one.
+/// This function combines the messages and block timestamps from multiple search results.
+/// For `MsgSendToCosmosClaim` messages, it ensures there are no duplicates by retaining only one copy per `event_nonce`.
+///
+/// # Arguments
+///
+/// * `search_results` - A vector of `SearchReturn` instances to be merged.
+///
+/// # Returns
+///
+/// * A single `SearchReturn` instance with combined messages and block timestamps, 
+///   and deduplicated `MsgSendToCosmosClaim` messages.
+fn merge_search_results(search_results: Vec<SearchReturn>) -> SearchReturn {
     let mut merged = HashMap::new();
     let mut block_timestamps = HashMap::new();
+    let mut cosmos_claims: HashMap<u64, MsgSendToCosmosClaim> = HashMap::new();
+
     for search_result in search_results {
         for (block_num, messages) in search_result.messages {
             let merged_messages = merged.entry(block_num).or_insert_with(Vec::new);
-            merged_messages.extend(messages);
+            for message in messages {
+                if let MessageWrapper::SendToCosmosClaim(claim) = &message {
+                    if let Some(existing_claim) = cosmos_claims.get(&claim.event_nonce) {
+                        if existing_claim != claim {
+                            merged_messages.push(message);
+                        }
+                    } else {
+                        cosmos_claims.insert(claim.event_nonce, claim.clone());
+                        merged_messages.push(message);
+                    }
+                } else {
+                    merged_messages.push(message);
+                }
+            }
         }
         block_timestamps.extend(search_result.block_timestamps);
     }
+
     SearchReturn {
         messages: merged,
         block_timestamps,
     }
 }
+
 
 const DEFAULT_RPC: &str = "https://gravitychain.io:9090";
 
@@ -365,11 +387,22 @@ async fn main() {
     );
 }
 
-/// Takes the combined user messages, creates a csv file with the following columns
+/// Creates a CSV file from the given `SearchReturn` instance.
+/// The CSV includes columns for block number, timestamp, transaction details, type, token type, and amount.
+/// The timestamp is converted to a human-readable date format.
+///
+/// # Arguments
+///
+/// * `input` - A `SearchReturn` instance containing the messages and block timestamps to be written to the CSV.
+///
+/// # Panics
+///
+/// * This function will panic if it fails to write to the CSV file.
 fn make_csv(input: SearchReturn) {
     let mut wtr = Writer::from_writer(vec![]);
     wtr.write_record(&[
         "Block",
+        "Timestamp",
         "Transaction To",
         "Transaction From",
         "Type",
@@ -382,15 +415,20 @@ fn make_csv(input: SearchReturn) {
     blocks.sort();
 
     for block in blocks {
+        let block_timestamp = input.block_timestamps.get(&block).unwrap();
+        let datetime = chrono::DateTime::<chrono::Utc>::from_timestamp(block_timestamp.seconds, 0).unwrap();
+        let formatted_timestamp = datetime.format("%Y-%m-%d %H:%M:%S").to_string();
+
         if let Some(messages) = input.messages.get(&block) {
             for message in messages {
                 match message {
                     MessageWrapper::Send(msg) => {
                         wtr.write_record(&[
                             block.to_string(),
+                            formatted_timestamp.clone(),
                             msg.to_address.clone(),
                             msg.from_address.clone(),
-                            "Send".to_string(),
+                            "SendTokens".to_string(),
                             msg.amount[0].denom.clone(),
                             msg.amount[0].amount.clone(),
                         ])
@@ -399,9 +437,10 @@ fn make_csv(input: SearchReturn) {
                     MessageWrapper::Reward(msg) => {
                         wtr.write_record(&[
                             block.to_string(),
+                            formatted_timestamp.clone(),
                             msg.validator_address.clone(),
                             msg.delegator_address.clone(),
-                            "WithdrawReward".to_string(),
+                            "WithdrawStakingReward".to_string(),
                             "".to_string(),
                             "".to_string(),
                         ])
@@ -410,6 +449,7 @@ fn make_csv(input: SearchReturn) {
                     MessageWrapper::Delegate(msg) => {
                         wtr.write_record(&[
                             block.to_string(),
+                            formatted_timestamp.clone(),
                             msg.delegator_address.clone(),
                             msg.validator_address.clone(),
                             "Delegate".to_string(),
@@ -421,8 +461,10 @@ fn make_csv(input: SearchReturn) {
                     MessageWrapper::UnDelegate(msg) => {
                         wtr.write_record(&[
                             block.to_string(),
+                            formatted_timestamp.clone(),
                             msg.validator_address.clone(),
                             msg.delegator_address.clone(),
+                            "UnDelegate".to_string(),
                             msg.amount.as_ref().unwrap().denom.clone(),
                             msg.amount.as_ref().unwrap().amount.clone(),
                         ])
@@ -431,9 +473,10 @@ fn make_csv(input: SearchReturn) {
                     MessageWrapper::Transfer(msg) => {
                         wtr.write_record(&[
                             block.to_string(),
+                            formatted_timestamp.clone(),
                             msg.receiver.clone(),
                             msg.sender.clone(),
-                            "Transfer".to_string(),
+                            "IbcTransfer".to_string(),
                             msg.token.as_ref().unwrap().denom.clone(),
                             msg.token.as_ref().unwrap().amount.clone(),
                         ])
@@ -442,9 +485,10 @@ fn make_csv(input: SearchReturn) {
                     MessageWrapper::RecvPacket(_) => {
                         wtr.write_record(&[
                             block.to_string(),
+                            formatted_timestamp.clone(),
                             "".to_string(),
                             "".to_string(),
-                            "RecvPacket".to_string(),
+                            "IbcRecieve".to_string(),
                             "".to_string(),
                             "".to_string(),
                         ])
@@ -453,17 +497,19 @@ fn make_csv(input: SearchReturn) {
                     MessageWrapper::SendToCosmosClaim(msg) => {
                         wtr.write_record(&[
                             block.to_string(),
+                            formatted_timestamp.clone(),
                             msg.cosmos_receiver.clone(),
-                            "".to_string(),
-                            "SendToCosmosClaim".to_string(),
-                            "".to_string(),
-                            "".to_string(),
+                            msg.ethereum_sender.clone(),
+                            "SendToGravity".to_string(),
+                            msg.token_contract.clone(),
+                            msg.amount.clone(),
                         ])
                         .unwrap();
                     }
                     MessageWrapper::SendToEth(msg) => {
                         wtr.write_record(&[
                             block.to_string(),
+                            formatted_timestamp.clone(),
                             msg.eth_dest.clone(),
                             msg.sender.clone(),
                             "SendToEth".to_string(),
