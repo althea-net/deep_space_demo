@@ -9,7 +9,7 @@ use cosmos_sdk_proto_althea::{
     ibc::{applications::transfer::v1::MsgTransfer, core::channel::v1::MsgRecvPacket},
 };
 use csv::Writer;
-use deep_space::address::Address;
+use deep_space::{address::Address, Coin};
 use deep_space::{
     client::{types::LatestBlock, Contact},
     utils::decode_any,
@@ -76,7 +76,7 @@ async fn search(contact: &Contact, target_address: Address, start: u64, end: u64
                 value: tx,
             };
             let tx_raw: TxRaw = decode_any(raw_tx_any).unwrap();
-            let _tx_hash = sha256::digest(&tx_raw.body_bytes);
+            let tx_hash = sha256::digest(&tx_raw.body_bytes);
             let body_any = prost_types::Any {
                 type_url: "/cosmos.tx.v1beta1.TxBody".to_string(),
                 value: tx_raw.body_bytes,
@@ -99,7 +99,32 @@ async fn search(contact: &Contact, target_address: Address, start: u64, end: u64
                         let delegator_address: Address = reward.delegator_address.parse().unwrap();
                         if delegator_address == target_address {
                             let txs = txs.entry(block_num).or_insert_with(Vec::new);
-                            txs.push(MessageWrapper::Reward(reward));
+                            // the tx itself doesn't contain any info about what tokens we get as a reward, this requires on chain
+                            // computation which is only displayed as a result in the logs, so we need to query the tx to get the logs
+                            // and use those logs to compute what tokens where recieved.
+                            let tx = contact
+                                .get_tx_by_hash(tx_hash.clone())
+                                .await
+                                .unwrap()
+                                .tx_response
+                                .unwrap()
+                                .logs;
+                            let mut amounts = Vec::new();
+                            for log in tx {
+                                for event in log.events {
+                                    if event.r#type == "coin_received"
+                                        && event.attributes[0].key == "receiver"
+                                        && event.attributes[0].value == target_address.to_string()
+                                    {
+                                        amounts.push(event.attributes[1].value.parse().unwrap());
+                                    }
+                                }
+                            }
+                            txs.push(MessageWrapper::Reward {
+                                validator: reward.validator_address.parse().unwrap(),
+                                delegator: delegator_address,
+                                amounts,
+                            })
                         }
                     }
                     MSG_DELEGATE => {
@@ -130,8 +155,41 @@ async fn search(contact: &Contact, target_address: Address, start: u64, end: u64
                         }
                     }
                     MSG_RECV_PACKET => {
-                        let _recv_packet = decode_msg_recv_packet(message);
-                        continue;
+                        // the tx itself doesn't contain any info about what tokens we have recieved via ibc or the sender
+                        // this requires on chain computation which is only displayed as a result in the logs, so we need to query the tx to get the logs
+                        // in this case we must first make sure the tx is a send packet to us, then we must check the logs for the amount
+                        let tx = contact
+                            .get_tx_by_hash(tx_hash.clone())
+                            .await
+                            .unwrap()
+                            .tx_response
+                            .unwrap()
+                            .logs;
+                        for log in tx {
+                            for event in log.events {
+                                if event.r#type == "fungible_token_packet"
+                                // this check ensures some future ibc extensions don't break this parser by
+                                // checking for specifically the type of packet we're looking at
+                                    && event.attributes[0].key == "module"
+                                    && event.attributes[0].value == "transfer"
+                                    // make sure this is actually about our target address
+                                    && event.attributes[2].key == "receiver"
+                                    && event.attributes[2].value == target_address.to_string()
+                                {
+                                    let txs = txs.entry(block_num).or_insert_with(Vec::new);
+                                    let mut amount = Coin {
+                                        denom: event.attributes[3].key.clone(),
+                                        amount: event.attributes[3].value.parse().unwrap(),
+                                    };
+                                    let sender = event.attributes[1].value.parse().unwrap();
+                                    txs.push(MessageWrapper::RecvPacket {
+                                        sender,
+                                        reciver: target_address,
+                                        amount: amount,
+                                    });
+                                }
+                            }
+                        }
                     }
                     MSG_SEND_TO_COSMOS_CLAIM => {
                         let send_to_cosmos_claim = decode_msg_send_to_cosmos_claim(message);
@@ -171,11 +229,19 @@ async fn search(contact: &Contact, target_address: Address, start: u64, end: u64
 /// Wrapper for messages that we expect and will decode
 enum MessageWrapper {
     Send(MsgSend),
-    Reward(MsgWithdrawDelegatorReward),
+    Reward {
+        validator: Address,
+        delegator: Address,
+        amounts: Vec<Coin>,
+    },
     Delegate(MsgDelegate),
     UnDelegate(MsgUndelegate),
     Transfer(MsgTransfer),
-    RecvPacket(MsgRecvPacket),
+    RecvPacket {
+        sender: Address,
+        reciver: Address,
+        amount: Coin,
+    },
     SendToCosmosClaim(MsgSendToCosmosClaim),
     SendToEth(MsgSendToEth),
 }
@@ -220,14 +286,6 @@ fn decode_msg_transfer(message: Any) -> MsgTransfer {
     decode_any(transfer_any).unwrap()
 }
 
-fn decode_msg_recv_packet(message: Any) -> MsgRecvPacket {
-    let recv_packet_any = prost_types::Any {
-        type_url: MSG_RECV_PACKET.to_string(),
-        value: message.value,
-    };
-    decode_any(recv_packet_any).unwrap()
-}
-
 fn decode_msg_send_to_cosmos_claim(message: Any) -> MsgSendToCosmosClaim {
     let send_to_cosmos_claim_any = prost_types::Any {
         type_url: MSG_SEND_TO_COSMOS_CLAIM.to_string(),
@@ -254,7 +312,7 @@ fn decode_msg_send_to_eth(message: Any) -> MsgSendToEth {
 ///
 /// # Returns
 ///
-/// * A single `SearchReturn` instance with combined messages and block timestamps, 
+/// * A single `SearchReturn` instance with combined messages and block timestamps,
 ///   and deduplicated `MsgSendToCosmosClaim` messages.
 fn merge_search_results(search_results: Vec<SearchReturn>) -> SearchReturn {
     let mut merged = HashMap::new();
@@ -287,7 +345,6 @@ fn merge_search_results(search_results: Vec<SearchReturn>) -> SearchReturn {
         block_timestamps,
     }
 }
-
 
 const DEFAULT_RPC: &str = "https://gravitychain.io:9090";
 
@@ -416,7 +473,8 @@ fn make_csv(input: SearchReturn) {
 
     for block in blocks {
         let block_timestamp = input.block_timestamps.get(&block).unwrap();
-        let datetime = chrono::DateTime::<chrono::Utc>::from_timestamp(block_timestamp.seconds, 0).unwrap();
+        let datetime =
+            chrono::DateTime::<chrono::Utc>::from_timestamp(block_timestamp.seconds, 0).unwrap();
         let formatted_timestamp = datetime.format("%Y-%m-%d %H:%M:%S").to_string();
 
         if let Some(messages) = input.messages.get(&block) {
@@ -434,17 +492,23 @@ fn make_csv(input: SearchReturn) {
                         ])
                         .unwrap();
                     }
-                    MessageWrapper::Reward(msg) => {
-                        wtr.write_record(&[
-                            block.to_string(),
-                            formatted_timestamp.clone(),
-                            msg.validator_address.clone(),
-                            msg.delegator_address.clone(),
-                            "WithdrawStakingReward".to_string(),
-                            "".to_string(),
-                            "".to_string(),
-                        ])
-                        .unwrap();
+                    MessageWrapper::Reward {
+                        validator,
+                        delegator,
+                        amounts,
+                    } => {
+                        for amount in amounts {
+                            wtr.write_record(&[
+                                block.to_string(),
+                                formatted_timestamp.clone(),
+                                validator.to_string(),
+                                delegator.to_string(),
+                                "WithdrawStakingReward".to_string(),
+                                amount.denom.clone(),
+                                amount.amount.to_string().clone(),
+                            ])
+                            .unwrap();
+                        }
                     }
                     MessageWrapper::Delegate(msg) => {
                         wtr.write_record(&[
@@ -482,15 +546,19 @@ fn make_csv(input: SearchReturn) {
                         ])
                         .unwrap();
                     }
-                    MessageWrapper::RecvPacket(_) => {
+                    MessageWrapper::RecvPacket {
+                        sender,
+                        reciver,
+                        amount,
+                    } => {
                         wtr.write_record(&[
                             block.to_string(),
                             formatted_timestamp.clone(),
-                            "".to_string(),
-                            "".to_string(),
+                            reciver.to_string(),
+                            sender.to_string(),
                             "IbcRecieve".to_string(),
-                            "".to_string(),
-                            "".to_string(),
+                            amount.denom.clone(),
+                            amount.amount.to_string(),
                         ])
                         .unwrap();
                     }
