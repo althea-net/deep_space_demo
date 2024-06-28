@@ -346,6 +346,68 @@ fn merge_search_results(search_results: Vec<SearchReturn>) -> SearchReturn {
     }
 }
 
+/// Downloads blocks and processes transactions in batches.
+///
+/// # Arguments
+///
+/// * `contact` - A reference to the Contact struct for interacting with the blockchain.
+/// * `target_address` - The address to search for in transactions.
+/// * `earliest_block` - The earliest block to start downloading from.
+/// * `latest_block` - The latest block to download to.
+/// * `batch_size` - The number of blocks each batch should contain.
+/// * `execute_size` - The number of batches to execute in parallel.
+///
+/// # Returns
+///
+/// * A `SearchReturn` instance containing the combined messages and block timestamps from all downloaded batches.
+async fn download_and_process_blocks(
+    contact: &Contact,
+    target_address: Address,
+    earliest_block: u64,
+    latest_block: u64,
+    batch_size: u64,
+    execute_size: usize,
+) -> SearchReturn {
+    let mut pos = earliest_block;
+    let mut futures = Vec::new();
+    while pos < latest_block {
+        let start = pos;
+        let end = if latest_block - pos > batch_size {
+            pos += batch_size;
+            pos
+        } else {
+            pos = latest_block;
+            latest_block
+        };
+        let fut = search(&contact, target_address.clone(), start, end);
+        futures.push(fut);
+    }
+
+    let mut futures = futures.into_iter();
+
+    let mut merged = SearchReturn {
+        messages: HashMap::new(),
+        block_timestamps: HashMap::new(),
+    };
+    let mut buf = Vec::new();
+    while let Some(fut) = futures.next() {
+        if buf.len() < execute_size {
+            buf.push(fut);
+        } else {
+            let res = join_all(buf).await;
+            let batch_merged = merge_search_results(res);
+            merged = merge_search_results(vec![merged, batch_merged]);
+            println!(
+                "Completed batch of {} blocks",
+                batch_size * execute_size as u64
+            );
+            buf = Vec::new();
+        }
+    }
+    let res = join_all(buf).await;
+    merge_search_results(vec![merged, merge_search_results(res)])
+}
+
 const DEFAULT_RPC: &str = "https://gravitychain.io:9090";
 
 /// Command line arguments
@@ -393,8 +455,7 @@ async fn main() {
         _ => panic!("Node is not synced or not running"),
     };
 
-    // now we find the earliest block this node has via binary search, we could just read it from
-    // the error message you get when requesting an earlier block, but this was more fun
+    // now we find the earliest block this node has via binary search
     let earliest_block = get_earliest_block(&contact, 0, latest_block).await;
     println!(
         "This node has {} blocks to download, starting clock now",
@@ -404,47 +465,16 @@ async fn main() {
 
     let batch_size = args.batch_size;
     let execute_size = args.execute_size;
-    let mut pos = earliest_block;
-    let mut futures = Vec::new();
-    while pos < latest_block {
-        let start = pos;
-        let end = if latest_block - pos > batch_size {
-            pos += batch_size;
-            pos
-        } else {
-            pos = latest_block;
-            latest_block
-        };
-        let fut = search(&contact, args.target_account, start, end);
-        futures.push(fut);
-    }
 
-    let mut futures = futures.into_iter();
-
-    // we merge all the messages into this one hashmap
-    let mut merged = SearchReturn {
-        messages: HashMap::new(),
-        block_timestamps: HashMap::new(),
-    };
-    let mut buf = Vec::new();
-    while let Some(fut) = futures.next() {
-        if buf.len() < execute_size {
-            buf.push(fut);
-        } else {
-            let res = join_all(buf).await;
-            let batch_merged = merge_search_results(res);
-            merged = merge_search_results(vec![merged, batch_merged]);
-            println!(
-                "Completed batch of {} blocks",
-                batch_size * execute_size as u64
-            );
-            buf = Vec::new();
-        }
-    }
-    let res = join_all(buf).await;
-
-    // the final storage of all target messages we have found
-    let final_merged = merge_search_results(vec![merged, merge_search_results(res)]);
+    let final_merged = download_and_process_blocks(
+        &contact,
+        args.target_account,
+        earliest_block,
+        latest_block,
+        batch_size,
+        execute_size,
+    )
+    .await;
 
     // now we make a csv of the resulting messages
     make_csv(final_merged);
@@ -454,6 +484,36 @@ async fn main() {
         "Completed transaction scan and dump elapsed time: {:?}",
         elapsed
     );
+}
+
+const TOKEN_MAPPINGS: &[(&str, &str, u32)] = &[
+    ("acanto", "canto", 18),
+    // Add more token mappings here
+];
+
+/// Requried to deal with tokens like weth or wbtc
+/// where small fractions have a high value
+struct FractionalCoin {
+    denom: String,
+    amount: f64,
+}
+
+fn translate_coin<T: Into<Coin>>(coin: T) -> FractionalCoin {
+    let coin = coin.into();
+    for &(denom, display_denom, decimals) in TOKEN_MAPPINGS {
+        if coin.denom == denom {
+            let factor = 10u128.pow(decimals);
+            let amount = coin.amount.to_string().parse::<f64>().unwrap() / factor as f64;
+            return FractionalCoin {
+                denom: display_denom.to_string(),
+                amount,
+            };
+        }
+    }
+    FractionalCoin {
+        denom: coin.denom,
+        amount: coin.amount.to_string().parse::<f64>().unwrap(),
+    }
 }
 
 /// Creates a CSV file from the given `SearchReturn` instance.
@@ -493,14 +553,15 @@ fn make_csv(input: SearchReturn) {
             for message in messages {
                 match message {
                     MessageWrapper::Send(msg) => {
+                        let translated_coin = translate_coin(msg.amount[0].clone());
                         wtr.write_record(&[
                             block.to_string(),
                             formatted_timestamp.clone(),
                             msg.to_address.clone(),
                             msg.from_address.clone(),
                             "SendTokens".to_string(),
-                            msg.amount[0].denom.clone(),
-                            msg.amount[0].amount.clone(),
+                            translated_coin.denom.clone(),
+                            translated_coin.amount.to_string(),
                         ])
                         .unwrap();
                     }
@@ -510,51 +571,55 @@ fn make_csv(input: SearchReturn) {
                         amounts,
                     } => {
                         for amount in amounts {
+                            let translated_coin = translate_coin(amount.clone());
                             wtr.write_record(&[
                                 block.to_string(),
                                 formatted_timestamp.clone(),
                                 validator.to_string(),
                                 delegator.to_string(),
                                 "WithdrawStakingReward".to_string(),
-                                amount.denom.clone(),
-                                amount.amount.to_string().clone(),
+                                translated_coin.denom.clone(),
+                                translated_coin.amount.to_string().clone(),
                             ])
                             .unwrap();
                         }
                     }
                     MessageWrapper::Delegate(msg) => {
+                        let translated_coin = translate_coin(msg.clone().amount.unwrap());
                         wtr.write_record(&[
                             block.to_string(),
                             formatted_timestamp.clone(),
                             msg.delegator_address.clone(),
                             msg.validator_address.clone(),
                             "Delegate".to_string(),
-                            msg.amount.as_ref().unwrap().denom.clone(),
-                            msg.amount.as_ref().unwrap().amount.clone(),
+                            translated_coin.denom.clone(),
+                            translated_coin.amount.to_string(),
                         ])
                         .unwrap();
                     }
                     MessageWrapper::UnDelegate(msg) => {
+                        let translated_coin = translate_coin(msg.clone().amount.unwrap());
                         wtr.write_record(&[
                             block.to_string(),
                             formatted_timestamp.clone(),
                             msg.validator_address.clone(),
                             msg.delegator_address.clone(),
                             "UnDelegate".to_string(),
-                            msg.amount.as_ref().unwrap().denom.clone(),
-                            msg.amount.as_ref().unwrap().amount.clone(),
+                            translated_coin.denom.clone(),
+                            translated_coin.amount.to_string(),
                         ])
                         .unwrap();
                     }
                     MessageWrapper::Transfer(msg) => {
+                        let translated_coin = translate_coin(msg.clone().token.unwrap());
                         wtr.write_record(&[
                             block.to_string(),
                             formatted_timestamp.clone(),
                             msg.receiver.clone(),
                             msg.sender.clone(),
                             "IbcTransfer".to_string(),
-                            msg.token.as_ref().unwrap().denom.clone(),
-                            msg.token.as_ref().unwrap().amount.clone(),
+                            translated_coin.denom.clone(),
+                            translated_coin.amount.to_string(),
                         ])
                         .unwrap();
                     }
@@ -563,14 +628,15 @@ fn make_csv(input: SearchReturn) {
                         reciver,
                         amount,
                     } => {
+                        let translated_coin = translate_coin(amount.clone());
                         wtr.write_record(&[
                             block.to_string(),
                             formatted_timestamp.clone(),
                             reciver.to_string(),
                             sender.to_string(),
                             "IbcRecieve".to_string(),
-                            amount.denom.clone(),
-                            amount.amount.to_string(),
+                            translated_coin.denom.clone(),
+                            translated_coin.amount.to_string(),
                         ])
                         .unwrap();
                     }
@@ -587,14 +653,15 @@ fn make_csv(input: SearchReturn) {
                         .unwrap();
                     }
                     MessageWrapper::SendToEth(msg) => {
+                        let translated_coin = translate_coin(msg.amount.clone().unwrap());
                         wtr.write_record(&[
                             block.to_string(),
                             formatted_timestamp.clone(),
                             msg.eth_dest.clone(),
                             msg.sender.clone(),
                             "SendToEth".to_string(),
-                            msg.amount.clone().unwrap().denom.clone(),
-                            msg.amount.clone().unwrap().amount.clone(),
+                            translated_coin.denom.clone(),
+                            translated_coin.amount.to_string(),
                         ])
                         .unwrap();
                     }
