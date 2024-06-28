@@ -18,7 +18,7 @@ use futures::future::join_all;
 use gravity_proto::gravity::{MsgSendToCosmosClaim, MsgSendToEth};
 use prost_types::{Any, Timestamp};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     time::{Duration, Instant},
     vec,
 };
@@ -116,7 +116,11 @@ async fn search(contact: &Contact, target_address: Address, start: u64, end: u64
                                         && event.attributes[0].key == "receiver"
                                         && event.attributes[0].value == target_address.to_string()
                                     {
-                                        amounts.push(event.attributes[1].value.parse().unwrap());
+                                        for coin in event.attributes[1].value.split(',') {
+                                            amounts.push(coin.parse().unwrap());
+                                        }
+                                        // there are multiple instances of coin_received in the logs for some reason
+                                        break;
                                     }
                                 }
                             }
@@ -332,19 +336,16 @@ fn decode_msg_send_to_eth(message: Any) -> MsgSendToEth {
 fn merge_search_results(search_results: Vec<SearchReturn>) -> SearchReturn {
     let mut merged = HashMap::new();
     let mut block_timestamps = HashMap::new();
-    let mut cosmos_claims: HashMap<u64, MsgSendToCosmosClaim> = HashMap::new();
+    // map of claim nonces used to discard repeats
+    let mut cosmos_claims: HashSet<u64> = HashSet::new();
 
     for search_result in search_results {
         for (block_num, messages) in search_result.messages {
             let merged_messages = merged.entry(block_num).or_insert_with(Vec::new);
             for message in messages {
                 if let MessageWrapper::SendToCosmosClaim(claim) = &message {
-                    if let Some(existing_claim) = cosmos_claims.get(&claim.event_nonce) {
-                        if existing_claim != claim {
-                            merged_messages.push(message);
-                        }
-                    } else {
-                        cosmos_claims.insert(claim.event_nonce, claim.clone());
+                    if !cosmos_claims.contains(&claim.event_nonce) {
+                        cosmos_claims.insert(claim.event_nonce);
                         merged_messages.push(message);
                     }
                 } else {
@@ -533,7 +534,7 @@ async fn main() {
     .await;
 
     // now we make a csv of the resulting messages
-    make_csv(final_merged);
+    make_csv(final_merged, args.target_account);
 
     let elapsed = start.elapsed();
     println!(
@@ -544,7 +545,72 @@ async fn main() {
 
 const TOKEN_MAPPINGS: &[(&str, &str, u32)] = &[
     ("acanto", "canto", 18),
-    // Add more token mappings here
+    ("ugraviton", "graviton", 6),
+    (
+        "gravity0x07baC35846e5eD502aA91AdF6A9e7aA210F2DcbE",
+        "erowan",
+        18,
+    ),
+    (
+        "gravity0x35a532d376FFd9a705d0Bb319532837337A398E7",
+        "WDOGE",
+        18,
+    ),
+    (
+        "gravity0x467719aD09025FcC6cF6F8311755809d45a5E5f3",
+        "AXL",
+        6,
+    ),
+    (
+        "gravity0x7f39C581F595B53c5cb19bD0b3f8dA6c935E2Ca0",
+        "WSTETH",
+        18,
+    ),
+    (
+        "gravity0x95aD61b0a150d79219dCF64E1E6Cc01f0B64C4cE",
+        "SHIB",
+        18,
+    ),
+    (
+        "gravity0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+        "USDC",
+        6,
+    ),
+    (
+        "gravity0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
+        "WETH",
+        18,
+    ),
+    (
+        "gravity0xa670d7237398238DE01267472C6f13e5B8010FD1",
+        "SOMM",
+        6,
+    ),
+    (
+        "gravity0xdAC17F958D2ee523a2206206994597C13D831ec7",
+        "USDT",
+        6,
+    ),
+    (
+        "gravity0xfB5c6815cA3AC72Ce9F5006869AE67f18bF77006",
+        "PSTAKE",
+        18,
+    ),
+    (
+        "ibc/0C273962C274B2C05B22D9474BFE5B84D6A6FCAD198CB9B0ACD35EA521A36606",
+        "NYM",
+        6,
+    ),
+    (
+        "ibc/5012B1C96F286E8A6604A87037CE51241C6F1CA195B71D1E261FCACB69FB6BC2",
+        "CHEQ",
+        9,
+    ),
+    (
+        "ibc/D157AD8A50DAB0FC4EB95BBE1D9407A590FA2CDEE04C90A76C005089BF76E519",
+        "FUND",
+        9,
+    ),
 ];
 
 /// Requried to deal with tokens like weth or wbtc
@@ -583,7 +649,7 @@ fn translate_coin<T: Into<Coin>>(coin: T) -> FractionalCoin {
 /// # Panics
 ///
 /// * This function will panic if it fails to write to the CSV file.
-fn make_csv(input: SearchReturn) {
+fn make_csv(input: SearchReturn, target_address: Address) {
     let mut wtr = Writer::from_writer(vec![]);
     wtr.write_record(&[
         "Block",
@@ -728,7 +794,7 @@ fn make_csv(input: SearchReturn) {
 
     wtr.flush().unwrap();
     let data = String::from_utf8(wtr.into_inner().unwrap()).unwrap();
-    std::fs::write("output.csv", data).expect("Failed to write to file");
+    std::fs::write(format!("{}.csv", target_address), data).expect("Failed to write to file");
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -783,6 +849,8 @@ mod tests {
     use super::*;
     #[test]
     fn test_address_parse() {
-        let _address: CosmosOrEthAddress = "0x7d26486cce9ae2ba0eae4f1be92ac379690c723b".parse().unwrap();
+        let _address: CosmosOrEthAddress = "0x7d26486cce9ae2ba0eae4f1be92ac379690c723b"
+            .parse()
+            .unwrap();
     }
 }
