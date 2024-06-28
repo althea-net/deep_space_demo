@@ -675,6 +675,26 @@ const TOKEN_MAPPINGS: &[(&str, &str, u32)] = &[
         18,
     ),
     (
+        "gravity0x817bbDbC3e8A1204f3691d14bB44992841e3dB35",
+        "CUDOS",
+        18,
+    ),
+    (
+        "gravity0x817bbDbC3e8A1204f3691d14bB44992841e3dB35",
+        "CUDOS",
+        18,
+    ),
+    (
+        "gravity0x8FAc8031e079F409135766C7d5De29cf22EF897C",
+        "HEART",
+        18,
+    ),
+    (
+        "gravity0xAa6E8127831c9DE45ae56bB1b0d4D4Da6e5665BD",
+        "ETH2x-FLI",
+        18,
+    ),
+    (
         "ibc/AD355DD10DF3C25CD42B5812F34077A1235DF343ED49A633B4E76AE98F3B78BC",
         "USK",
         6,
