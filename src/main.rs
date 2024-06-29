@@ -58,7 +58,16 @@ pub struct SearchReturn {
 /// Searches a segment of blocks for transactions to or from a target address
 /// returns a Hashmap of transactions indexed by block height
 async fn search(contact: &Contact, target_address: Address, start: u64, end: u64) -> SearchReturn {
-    let blocks = contact.get_block_range(start, end).await.unwrap();
+    let mut blocks = contact.get_block_range(start, end).await;
+    while let Err(e) = blocks {
+        println!(
+            "Failed to get block range {} to {} with error {}, retrying",
+            start, end, e
+        );
+        blocks = contact.get_block_range(start, end).await;
+    }
+    let blocks = blocks.unwrap();
+
     let mut txs = HashMap::new();
     let mut block_timestamps = HashMap::new();
 
@@ -215,7 +224,8 @@ async fn search(contact: &Contact, target_address: Address, start: u64, end: u64
                                             .clone()
                                             .split('/')
                                             .last()
-                                            .unwrap().to_string(),
+                                            .unwrap()
+                                            .to_string(),
                                         amount: event.attributes[4].value.parse().unwrap(),
                                     };
                                     let sender = event.attributes[1].value.parse().unwrap();
@@ -565,10 +575,12 @@ async fn main() {
 
     let contact = Contact::new(&args.rpc, timeout, &prefix).expect("invalid url");
 
-    let status = contact
-        .get_latest_block()
-        .await
-        .expect("Failed to get chain status, grpc error");
+    let mut status = contact.get_latest_block().await;
+    while status.is_err() {
+        println!("Failed to get latest block, retrying");
+        status = contact.get_latest_block().await;
+    }
+    let status = status.unwrap();
 
     // get the latest block this node has
     let latest_block = match status {
