@@ -210,10 +210,10 @@ async fn search(contact: &Contact, target_address: Address, start: u64, end: u64
                                     && event.attributes[2].value == target_address.to_string()
                                 {
                                     let txs = txs.entry(block_num).or_insert_with(Vec::new);
-                                    println!("{:?}", event.attributes[3]);
+                                    println!("{:?}", event.attributes[4]);
                                     let amount = Coin {
                                         denom: event.attributes[3].key.clone(),
-                                        amount: event.attributes[3].value.parse().unwrap(),
+                                        amount: event.attributes[4].value.parse().unwrap(),
                                     };
                                     let sender = event.attributes[1].value.parse().unwrap();
                                     txs.push(MessageWrapper::RecvPacket {
