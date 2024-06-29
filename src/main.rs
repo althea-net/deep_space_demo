@@ -23,8 +23,6 @@ use std::{
     vec,
 };
 
-const TIMEOUT: Duration = Duration::from_secs(60);
-
 const MSG_SEND: &str = "/cosmos.bank.v1beta1.MsgSend";
 const MSG_WITHDRAW_REWARD: &str = "/cosmos.distribution.v1beta1.MsgWithdrawDelegatorReward";
 const MSG_DELEGATE: &str = "/cosmos.staking.v1beta1.MsgDelegate";
@@ -210,9 +208,14 @@ async fn search(contact: &Contact, target_address: Address, start: u64, end: u64
                                     && event.attributes[2].value == target_address.to_string()
                                 {
                                     let txs = txs.entry(block_num).or_insert_with(Vec::new);
-                                    println!("{:?}", event.attributes[4]);
+                                    println!("{:?}", event.attributes[3]);
                                     let amount = Coin {
-                                        denom: event.attributes[3].key.clone(),
+                                        denom: event.attributes[3]
+                                            .value
+                                            .clone()
+                                            .split('/')
+                                            .last()
+                                            .unwrap().to_string(),
                                         amount: event.attributes[4].value.parse().unwrap(),
                                     };
                                     let sender = event.attributes[1].value.parse().unwrap();
@@ -546,14 +549,21 @@ struct Opts {
     /// Will error if the node does not have the specificed block
     #[arg(short, long)]
     start_at_block: Option<u64>,
+
+    /// How long to wait for a response from a full node before timing out
+    /// in seconds. Set this conservatively to avoid crashing an operation
+    /// that has already been running for a long time.
+    #[arg(short, long, default_value = "30")]
+    timeout: u64,
 }
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
     let args = Opts::parse();
     let prefix = args.target_account.get_prefix();
+    let timeout = Duration::from_secs(args.timeout);
 
-    let contact = Contact::new(&args.rpc, TIMEOUT, &prefix).expect("invalid url");
+    let contact = Contact::new(&args.rpc, timeout, &prefix).expect("invalid url");
 
     let status = contact
         .get_latest_block()
