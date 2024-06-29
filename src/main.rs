@@ -16,11 +16,10 @@ use deep_space::{
 };
 use futures::future::join_all;
 use gravity_proto::gravity::{MsgSendToCosmosClaim, MsgSendToEth};
+use log::info;
 use prost_types::{Any, Timestamp};
 use std::{
-    collections::{HashMap, HashSet},
-    time::{Duration, Instant},
-    vec,
+    collections::{HashMap, HashSet}, env, time::{Duration, Instant}, vec
 };
 
 const MSG_SEND: &str = "/cosmos.bank.v1beta1.MsgSend";
@@ -60,7 +59,7 @@ pub struct SearchReturn {
 async fn search(contact: &Contact, target_address: Address, start: u64, end: u64) -> SearchReturn {
     let mut blocks = contact.get_block_range(start, end).await;
     while let Err(e) = blocks {
-        println!(
+        info!(
             "Failed to get block range {} to {} with error {}, retrying",
             start, end, e
         );
@@ -115,7 +114,7 @@ async fn search(contact: &Contact, target_address: Address, start: u64, end: u64
                             let tx = match contact.get_tx_by_hash(tx_hash.clone()).await {
                                 Ok(t) => t.tx_response.unwrap().logs,
                                 Err(_) => {
-                                    println!("Failed to find tx by hash this represents an indexing error on your node! {}", tx_hash);
+                                    info!("Failed to find tx by hash this represents an indexing error on your node! {}", tx_hash);
                                     continue;
                                 }
                             };
@@ -188,7 +187,7 @@ async fn search(contact: &Contact, target_address: Address, start: u64, end: u64
                                 });
                             }
                         } else {
-                            println!(
+                            info!(
                                 "Could not parse ibc transfer sender {} or reciver {}",
                                 transfer.sender, transfer.receiver
                             );
@@ -201,7 +200,7 @@ async fn search(contact: &Contact, target_address: Address, start: u64, end: u64
                         let tx = match contact.get_tx_by_hash(tx_hash.clone()).await {
                             Ok(t) => t.tx_response.unwrap().logs,
                             Err(_) => {
-                                println!("Failed to find tx by hash this represents an indexing error on your node! {}", tx_hash);
+                                info!("Failed to find tx by hash this represents an indexing error on your node! {}", tx_hash);
                                 continue;
                             }
                         };
@@ -217,7 +216,7 @@ async fn search(contact: &Contact, target_address: Address, start: u64, end: u64
                                     && event.attributes[2].value == target_address.to_string()
                                 {
                                     let txs = txs.entry(block_num).or_insert_with(Vec::new);
-                                    println!("{:?}", event.attributes[3]);
+                                    info!("{:?}", event.attributes[3]);
                                     let amount = Coin {
                                         denom: event.attributes[3]
                                             .value
@@ -253,7 +252,7 @@ async fn search(contact: &Contact, target_address: Address, start: u64, end: u64
                                 });
                             }
                         } else {
-                            println!(
+                            info!(
                                 "Could not parse cosmos receiver {} for tx {}",
                                 send_to_cosmos_claim.cosmos_receiver,
                                 tx_hash.clone()
@@ -272,13 +271,13 @@ async fn search(contact: &Contact, target_address: Address, start: u64, end: u64
                         }
                     }
                     _ => {
-                        //println!("unknown message type {}", message.type_url);
+                        //info!("unknown message type {}", message.type_url);
                     }
                 }
             }
         }
     }
-    // println!(
+    // info!(
     //     "Got batch of {} blocks, {} contain target messages \n",
     //     blocks_len,
     //     txs.len()
@@ -514,7 +513,7 @@ async fn download_and_process_blocks(
                 / total_batches_completed_so_far)
                 * batches_remaining as u32;
             // log information
-            println!(
+            info!(
                 "Completed batch of {} blocks in {} ETA {}",
                 total_processed,
                 format_duration_short(start.elapsed()),
@@ -569,6 +568,13 @@ struct Opts {
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
+    // Initialize the logger
+    if env::var("RUST_LOG").is_err() {
+        // Set the default logging level to info if RUST_LOG is not set
+        env::set_var("RUST_LOG", "info");
+    }
+    env_logger::init();
+
     let args = Opts::parse();
     let prefix = args.target_account.get_prefix();
     let timeout = Duration::from_secs(args.timeout);
@@ -577,7 +583,7 @@ async fn main() {
 
     let mut status = contact.get_latest_block().await;
     while status.is_err() {
-        println!("Failed to get latest block, retrying");
+        info!("Failed to get latest block, retrying");
         status = contact.get_latest_block().await;
     }
     let status = status.unwrap();
@@ -595,7 +601,7 @@ async fn main() {
         Some(block) => block,
         None => get_earliest_block(&contact, 0, latest_block).await,
     };
-    println!(
+    info!(
         "This node has {} blocks to download, starting clock now",
         latest_block - earliest_block
     );
@@ -618,7 +624,7 @@ async fn main() {
     make_csv(final_merged, args.target_account);
 
     let elapsed = start.elapsed();
-    println!(
+    info!(
         "Completed transaction scan and dump elapsed time: {:?}",
         elapsed
     );
