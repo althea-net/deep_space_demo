@@ -19,7 +19,10 @@ use gravity_proto::gravity::{MsgSendToCosmosClaim, MsgSendToEth};
 use log::info;
 use prost_types::{Any, Timestamp};
 use std::{
-    collections::{HashMap, HashSet}, env, time::{Duration, Instant}, vec
+    collections::{HashMap, HashSet},
+    env,
+    time::{Duration, Instant},
+    vec,
 };
 
 const MSG_SEND: &str = "/cosmos.bank.v1beta1.MsgSend";
@@ -111,13 +114,22 @@ async fn search(contact: &Contact, target_address: Address, start: u64, end: u64
                             // the tx itself doesn't contain any info about what tokens we get as a reward, this requires on chain
                             // computation which is only displayed as a result in the logs, so we need to query the tx to get the logs
                             // and use those logs to compute what tokens where recieved.
-                            let tx = match contact.get_tx_by_hash(tx_hash.clone()).await {
-                                Ok(t) => t.tx_response.unwrap().logs,
-                                Err(_) => {
+                            let mut tx = contact.get_tx_by_hash(tx_hash.clone()).await;
+                            let mut tries = 0;
+                            while let Err(e) = tx {
+                                info!(
+                                    "Failed to get tx by hash {} with error {}, retrying",
+                                    tx_hash, e
+                                );
+                                tx = contact.get_tx_by_hash(tx_hash.clone()).await;
+                                tries += 1;
+                                if tries > 10 {
                                     info!("Failed to find tx by hash this represents an indexing error on your node! {}", tx_hash);
                                     continue;
                                 }
-                            };
+                            }
+                            let tx = tx.unwrap().tx_response.unwrap().logs;
+
                             let mut amounts = Vec::new();
                             let mut found = false;
                             for log in tx {
