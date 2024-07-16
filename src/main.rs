@@ -1,6 +1,7 @@
 use clap::Parser;
 use cosmos_sdk_proto_althea::cosmos::tx::v1beta1::{TxBody, TxRaw};
 use csv::Writer;
+use deep_space::utils::historical_grpc_query;
 use deep_space::{address::Address, Coin};
 use deep_space::{
     client::{types::LatestBlock, Contact},
@@ -18,6 +19,7 @@ use std::{
     time::{Duration, Instant},
     vec,
 };
+use tonic::transport::Channel;
 
 const MSG_BID: &str = "/auction.v1.MsgBid";
 
@@ -52,11 +54,13 @@ pub struct SearchReturn {
 
 /// Searches a segment of blocks for auction module transactions
 /// returns a Hashmap of transactions indexed by block height
-async fn search(contact: &Contact, start: u64, end: u64) -> SearchReturn {
+async fn search(
+    contact: &Contact,
+    mut query_client: AuctionQueryClient<Channel>,
+    start: u64,
+    end: u64,
+) -> SearchReturn {
     let mut blocks = contact.get_block_range(start, end).await;
-    let mut query_client = AuctionQueryClient::connect(contact.get_url())
-        .await
-        .unwrap();
 
     while let Err(e) = blocks {
         info!(
@@ -93,17 +97,9 @@ async fn search(contact: &Contact, start: u64, end: u64) -> SearchReturn {
                     MSG_BID => {
                         let send = decode_msg_bid(message);
                         let txs = txs.entry(block_num).or_insert_with(Vec::new);
-
-                        // look up auction info to include in the output
-                        let auction = query_client
-                            .auction_by_id(QueryAuctionByIdRequest {
-                                auction_id: send.auction_id,
-                            })
-                            .await
-                            .unwrap()
-                            .into_inner()
-                            .auction
-                            .unwrap();
+                        let auction =
+                            get_historic_auction(&mut query_client, send.auction_id, block_num)
+                                .await;
 
                         txs.push(MsgBidWrapper {
                             send,
@@ -126,6 +122,45 @@ async fn search(contact: &Contact, start: u64, end: u64) -> SearchReturn {
         messages: txs,
         block_timestamps,
     }
+}
+
+/// Gets historical auction data, will search around the time of the transaction for a state snapshot
+/// that has the data we want, looking both forward and backward in chain state
+async fn get_historic_auction(
+    query_client: &mut AuctionQueryClient<Channel>,
+    auction_id: u64,
+    block_num: u64,
+) -> Auction {
+    let mut auction = None;
+    let mut rounded_block_num = (block_num / 100) * 100;
+    let original_founded_block_num = rounded_block_num;
+    const TRIES: u64 = 10;
+    let mut tires_forward = 0;
+    let mut tries_backward = 0;
+    while auction.is_none() {
+        info!(
+            "Querying auction {} at height {}",
+            auction_id, rounded_block_num
+        );
+        let request = QueryAuctionByIdRequest { auction_id };
+        let request = historical_grpc_query(request, rounded_block_num);
+        auction = query_client
+            .auction_by_id(request)
+            .await
+            .unwrap()
+            .into_inner()
+            .auction;
+        if tries_backward < TRIES {
+            rounded_block_num = original_founded_block_num - 100 * tries_backward;
+            tries_backward += 1;
+        } else if tires_forward < TRIES {
+            rounded_block_num = original_founded_block_num + 100 * tires_forward;
+            tires_forward += 1;
+        } else {
+            panic!("Failed to find auction {} in historical data", auction_id);
+        }
+    }
+    auction.unwrap()
 }
 
 fn decode_msg_bid(message: Any) -> MsgBid {
@@ -188,6 +223,10 @@ async fn download_and_process_blocks(
     batch_size: u64,
     execute_size: usize,
 ) -> SearchReturn {
+    let query_client = AuctionQueryClient::connect(contact.get_url())
+        .await
+        .unwrap();
+
     let mut pos = earliest_block;
     let mut futures = Vec::new();
     while pos < latest_block {
@@ -199,7 +238,7 @@ async fn download_and_process_blocks(
             pos = latest_block;
             latest_block
         };
-        let fut = search(contact, start, end);
+        let fut = search(contact, query_client.clone(), start, end);
         futures.push(fut);
     }
 
@@ -483,6 +522,21 @@ const TOKEN_MAPPINGS: &[(&str, &str, u32)] = &[
         18,
     ),
     (
+        "gravity0x30f271C9E86D2B7d00a6376Cd96A1cFBD5F0b9b3",
+        "DEC",
+        18,
+    ),
+    (
+        "gravity0x7D1AfA7B718fb893dB30A3aBc0Cfc608AaCfeBB0",
+        "MATIC",
+        18,
+    ),
+    (
+        "gravity0xF411903cbC70a74d22900a5DE66A2dda66507255",
+        "VERA",
+        18,
+    ),
+    (
         "ibc/AD355DD10DF3C25CD42B5812F34077A1235DF343ED49A633B4E76AE98F3B78BC",
         "USK",
         6,
@@ -526,6 +580,21 @@ const TOKEN_MAPPINGS: &[(&str, &str, u32)] = &[
         "ibc/D157AD8A50DAB0FC4EB95BBE1D9407A590FA2CDEE04C90A76C005089BF76E519",
         "FUND",
         9,
+    ),
+    (
+        "ibc/E05A4DAEA5681A09067DC213F32464639D18007215C87964EC45FF876B5EE82B",
+        "ARCH",
+        18,
+    ),
+    (
+        "ibc/0EB6D5E44D1587D12E222C1155181884098202F56263795259C53536D07C2E65",
+        "MEME",
+        6,
+    ),
+    (
+        "ibc/00F2B62EB069321A454B708876476AFCD9C23C8C9C4A5A206DDF1CD96B645057",
+        "MNTL",
+        6,
     ),
 ];
 
@@ -593,7 +662,7 @@ fn make_csv(input: SearchReturn) {
                 let auction_amount = translate_coin(message.auction.clone().amount.unwrap());
                 let bid_amount_coin = Coin {
                     amount: message.send.amount.into(),
-                    denom: "ugravition".to_string(),
+                    denom: "ugraviton".to_string(),
                 };
                 wtr.write_record(&[
                     formatted_timestamp.clone(),
