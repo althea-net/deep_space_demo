@@ -1,13 +1,5 @@
 use clap::Parser;
-use cosmos_sdk_proto_althea::{
-    cosmos::{
-        bank::v1beta1::MsgSend,
-        distribution::v1beta1::MsgWithdrawDelegatorReward,
-        staking::v1beta1::{MsgDelegate, MsgUndelegate},
-        tx::v1beta1::{TxBody, TxRaw},
-    },
-    ibc::applications::transfer::v1::MsgTransfer,
-};
+use cosmos_sdk_proto_althea::cosmos::tx::v1beta1::{TxBody, TxRaw};
 use csv::Writer;
 use deep_space::{address::Address, Coin};
 use deep_space::{
@@ -15,24 +7,19 @@ use deep_space::{
     utils::decode_any,
 };
 use futures::future::join_all;
-use gravity_proto::gravity::{MsgSendToCosmosClaim, MsgSendToEth};
+use gravity_proto::auction::{query_client::QueryClient as AuctionQueryClient, Auction};
+use gravity_proto::auction::{MsgBid, QueryAuctionByIdRequest};
 use log::info;
 use prost_types::{Any, Timestamp};
 use std::{
-    collections::{HashMap, HashSet},
+    cmp::max,
+    collections::HashMap,
     env,
     time::{Duration, Instant},
     vec,
 };
 
-const MSG_SEND: &str = "/cosmos.bank.v1beta1.MsgSend";
-const MSG_WITHDRAW_REWARD: &str = "/cosmos.distribution.v1beta1.MsgWithdrawDelegatorReward";
-const MSG_DELEGATE: &str = "/cosmos.staking.v1beta1.MsgDelegate";
-const MSG_UNDELEGATE: &str = "/cosmos.staking.v1beta1.MsgUndelegate";
-const MSG_TRANSFER: &str = "/ibc.applications.transfer.v1.MsgTransfer";
-const MSG_RECV_PACKET: &str = "/ibc.core.channel.v1.MsgRecvPacket";
-const MSG_SEND_TO_COSMOS_CLAIM: &str = "/gravity.v1.MsgSendToCosmosClaim";
-const MSG_SEND_TO_ETH: &str = "/gravity.v1.MsgSendToEth";
+const MSG_BID: &str = "/auction.v1.MsgBid";
 
 /// finds earliest available block using binary search, keep in mind this cosmos
 /// node will not have history from chain halt upgrades and could be state synced
@@ -52,15 +39,25 @@ async fn get_earliest_block(contact: &Contact, mut start: u64, mut end: u64) -> 
     start + 1
 }
 
+pub struct MsgBidWrapper {
+    pub send: MsgBid,
+    pub auction: Auction,
+    pub txhash: String,
+}
+
 pub struct SearchReturn {
-    messages: HashMap<u64, Vec<MessageWrapper>>,
+    messages: HashMap<u64, Vec<MsgBidWrapper>>,
     block_timestamps: HashMap<u64, Timestamp>,
 }
 
-/// Searches a segment of blocks for transactions to or from a target address
+/// Searches a segment of blocks for auction module transactions
 /// returns a Hashmap of transactions indexed by block height
-async fn search(contact: &Contact, target_address: Address, start: u64, end: u64) -> SearchReturn {
+async fn search(contact: &Contact, start: u64, end: u64) -> SearchReturn {
     let mut blocks = contact.get_block_range(start, end).await;
+    let mut query_client = AuctionQueryClient::connect(contact.get_url())
+        .await
+        .unwrap();
+
     while let Err(e) = blocks {
         info!(
             "Failed to get block range {} to {} with error {}, retrying",
@@ -93,198 +90,29 @@ async fn search(contact: &Contact, target_address: Address, start: u64, end: u64
             let tx_body: TxBody = decode_any(body_any).unwrap();
             for message in tx_body.messages {
                 match message.type_url.as_str() {
-                    MSG_SEND => {
-                        let send = decode_msg_send(message);
-                        let source_address: Address = send.from_address.parse().unwrap();
-                        let destination_address: Address = send.to_address.parse().unwrap();
-                        if source_address == target_address || destination_address == target_address
-                        {
-                            let txs = txs.entry(block_num).or_insert_with(Vec::new);
-                            txs.push(MessageWrapper::Send {
-                                send,
-                                txhash: tx_hash.clone(),
-                            });
-                        }
-                    }
-                    MSG_WITHDRAW_REWARD => {
-                        let reward = decode_msg_withdraw_delegator_reward(message);
-                        let delegator_address: Address = reward.delegator_address.parse().unwrap();
-                        if delegator_address == target_address {
-                            let txs = txs.entry(block_num).or_insert_with(Vec::new);
-                            // the tx itself doesn't contain any info about what tokens we get as a reward, this requires on chain
-                            // computation which is only displayed as a result in the logs, so we need to query the tx to get the logs
-                            // and use those logs to compute what tokens where recieved.
-                            let mut tx = contact.get_tx_by_hash(tx_hash.clone()).await;
-                            let mut tries = 0;
-                            while let Err(e) = tx {
-                                info!(
-                                    "Failed to get tx by hash {} with error {}, retrying",
-                                    tx_hash, e
-                                );
-                                tx = contact.get_tx_by_hash(tx_hash.clone()).await;
-                                tries += 1;
-                                if tries > 10 {
-                                    info!("Failed to find tx by hash this represents an indexing error on your node! {}", tx_hash);
-                                    continue;
-                                }
-                            }
-                            let tx = tx.unwrap().tx_response.unwrap().logs;
+                    MSG_BID => {
+                        let send = decode_msg_bid(message);
+                        let txs = txs.entry(block_num).or_insert_with(Vec::new);
 
-                            let mut amounts = Vec::new();
-                            let mut found = false;
-                            for log in tx {
-                                for event in log.events {
-                                    if event.r#type == "coin_received"
-                                        && event.attributes[0].key == "receiver"
-                                        && event.attributes[0].value == target_address.to_string()
-                                    {
-                                        for coin in event.attributes[1].value.split(',') {
-                                            amounts.push(coin.parse().unwrap());
-                                        }
-                                        found = true;
-                                        // there are multiple instances of coin_received in the logs for some reason
-                                        break;
-                                    }
-                                }
-                                // we don't want to process other logs in this message, they will be duplicates
-                                if found {
-                                    break;
-                                }
-                            }
-                            txs.push(MessageWrapper::Reward {
-                                validator: reward.validator_address.parse().unwrap(),
-                                delegator: delegator_address,
-                                amounts,
-                                txhash: tx_hash.clone(),
-                            });
-                            // staking reward claims are normally bunded several to a tx, but the log is printed
-                            // once per claim, so if we keep looping we will just get duplicates
-                            break;
-                        }
+                        // look up auction info to include in the output
+                        let auction = query_client
+                            .auction_by_id(QueryAuctionByIdRequest {
+                                auction_id: send.auction_id,
+                            })
+                            .await
+                            .unwrap()
+                            .into_inner()
+                            .auction
+                            .unwrap();
+
+                        txs.push(MsgBidWrapper {
+                            send,
+                            auction,
+                            txhash: tx_hash.clone(),
+                        });
                     }
-                    MSG_DELEGATE => {
-                        let delegate = decode_msg_delegate(message);
-                        let delegator_address: Address =
-                            delegate.delegator_address.parse().unwrap();
-                        if delegator_address == target_address {
-                            let txs = txs.entry(block_num).or_insert_with(Vec::new);
-                            txs.push(MessageWrapper::Delegate {
-                                delegate,
-                                txhash: tx_hash.clone(),
-                            });
-                        }
-                    }
-                    MSG_UNDELEGATE => {
-                        let undelegate = decode_msg_undelegate(message);
-                        let delegator_address: Address =
-                            undelegate.delegator_address.parse().unwrap();
-                        if delegator_address == target_address {
-                            let txs = txs.entry(block_num).or_insert_with(Vec::new);
-                            txs.push(MessageWrapper::UnDelegate {
-                                undelegate,
-                                txhash: tx_hash.clone(),
-                            });
-                        }
-                    }
-                    MSG_TRANSFER => {
-                        let transfer = decode_msg_transfer(message);
-                        let sender: Result<Address, _> = transfer.sender.parse();
-                        let receiver: Result<CosmosOrEthAddress, _> = transfer.receiver.parse();
-                        if let (Ok(sender), Ok(reciver)) = (sender, receiver) {
-                            if sender == target_address || reciver == target_address {
-                                let txs = txs.entry(block_num).or_insert_with(Vec::new);
-                                txs.push(MessageWrapper::Transfer {
-                                    transfer,
-                                    txhash: tx_hash.clone(),
-                                });
-                            }
-                        } else {
-                            info!(
-                                "Could not parse ibc transfer sender {} or reciver {}",
-                                transfer.sender, transfer.receiver
-                            );
-                        }
-                    }
-                    MSG_RECV_PACKET => {
-                        // the tx itself doesn't contain any info about what tokens we have recieved via ibc or the sender
-                        // this requires on chain computation which is only displayed as a result in the logs, so we need to query the tx to get the logs
-                        // in this case we must first make sure the tx is a send packet to us, then we must check the logs for the amount
-                        let tx = match contact.get_tx_by_hash(tx_hash.clone()).await {
-                            Ok(t) => t.tx_response.unwrap().logs,
-                            Err(_) => {
-                                info!("Failed to find tx by hash this represents an indexing error on your node! {}", tx_hash);
-                                continue;
-                            }
-                        };
-                        for log in tx {
-                            for event in log.events {
-                                if event.r#type == "fungible_token_packet"
-                                // this check ensures some future ibc extensions don't break this parser by
-                                // checking for specifically the type of packet we're looking at
-                                    && event.attributes[0].key == "module"
-                                    && event.attributes[0].value == "transfer"
-                                    // make sure this is actually about our target address
-                                    && event.attributes[2].key == "receiver"
-                                    && event.attributes[2].value == target_address.to_string()
-                                {
-                                    let txs = txs.entry(block_num).or_insert_with(Vec::new);
-                                    info!("{:?}", event.attributes[3]);
-                                    let amount = Coin {
-                                        denom: event.attributes[3]
-                                            .value
-                                            .clone()
-                                            .split('/')
-                                            .last()
-                                            .unwrap()
-                                            .to_string(),
-                                        amount: event.attributes[4].value.parse().unwrap(),
-                                    };
-                                    let sender = event.attributes[1].value.parse().unwrap();
-                                    txs.push(MessageWrapper::RecvPacket {
-                                        sender,
-                                        reciver: target_address,
-                                        amount: amount,
-                                        txhash: tx_hash.clone(),
-                                    });
-                                }
-                            }
-                        }
-                    }
-                    MSG_SEND_TO_COSMOS_CLAIM => {
-                        let send_to_cosmos_claim = decode_msg_send_to_cosmos_claim(message);
-                        if let Ok(destination_address) =
-                            send_to_cosmos_claim.cosmos_receiver.parse()
-                        {
-                            let destination_address: Address = destination_address;
-                            if destination_address == target_address {
-                                let txs = txs.entry(block_num).or_insert_with(Vec::new);
-                                txs.push(MessageWrapper::SendToCosmosClaim {
-                                    claim: send_to_cosmos_claim,
-                                    txhash: tx_hash.clone(),
-                                });
-                            }
-                        } else {
-                            info!(
-                                "Could not parse cosmos receiver {} for tx {}",
-                                send_to_cosmos_claim.cosmos_receiver,
-                                tx_hash.clone()
-                            );
-                        }
-                    }
-                    MSG_SEND_TO_ETH => {
-                        let send_to_eth = decode_msg_send_to_eth(message);
-                        let source_address: Address = send_to_eth.sender.parse().unwrap();
-                        if source_address == target_address {
-                            let txs = txs.entry(block_num).or_insert_with(Vec::new);
-                            txs.push(MessageWrapper::SendToEth {
-                                send: send_to_eth,
-                                txhash: tx_hash.clone(),
-                            });
-                        }
-                    }
-                    _ => {
-                        //info!("unknown message type {}", message.type_url);
-                    }
+                    // some other message we don't care about
+                    _ => {}
                 }
             }
         }
@@ -300,141 +128,12 @@ async fn search(contact: &Contact, target_address: Address, start: u64, end: u64
     }
 }
 
-/// Wrapper for messages that we expect and will decode
-enum MessageWrapper {
-    Send {
-        send: MsgSend,
-        txhash: String,
-    },
-    Reward {
-        validator: Address,
-        delegator: Address,
-        amounts: Vec<Coin>,
-        txhash: String,
-    },
-    Delegate {
-        delegate: MsgDelegate,
-        txhash: String,
-    },
-    UnDelegate {
-        undelegate: MsgUndelegate,
-        txhash: String,
-    },
-    Transfer {
-        transfer: MsgTransfer,
-        txhash: String,
-    },
-    RecvPacket {
-        sender: Address,
-        reciver: Address,
-        amount: Coin,
-        txhash: String,
-    },
-    SendToCosmosClaim {
-        claim: MsgSendToCosmosClaim,
-        txhash: String,
-    },
-    SendToEth {
-        send: MsgSendToEth,
-        txhash: String,
-    },
-}
-
-fn decode_msg_send(message: Any) -> MsgSend {
+fn decode_msg_bid(message: Any) -> MsgBid {
     let send_any = prost_types::Any {
-        type_url: MSG_SEND.to_string(),
+        type_url: MSG_BID.to_string(),
         value: message.value,
     };
     decode_any(send_any).unwrap()
-}
-
-fn decode_msg_withdraw_delegator_reward(message: Any) -> MsgWithdrawDelegatorReward {
-    let reward_any = prost_types::Any {
-        type_url: MSG_WITHDRAW_REWARD.to_string(),
-        value: message.value,
-    };
-    decode_any(reward_any).unwrap()
-}
-
-fn decode_msg_delegate(message: Any) -> MsgDelegate {
-    let delegate_any = prost_types::Any {
-        type_url: MSG_DELEGATE.to_string(),
-        value: message.value,
-    };
-    decode_any(delegate_any).unwrap()
-}
-
-fn decode_msg_undelegate(message: Any) -> MsgUndelegate {
-    let undelegate_any = prost_types::Any {
-        type_url: MSG_UNDELEGATE.to_string(),
-        value: message.value,
-    };
-    decode_any(undelegate_any).unwrap()
-}
-
-fn decode_msg_transfer(message: Any) -> MsgTransfer {
-    let transfer_any = prost_types::Any {
-        type_url: MSG_TRANSFER.to_string(),
-        value: message.value,
-    };
-    decode_any(transfer_any).unwrap()
-}
-
-fn decode_msg_send_to_cosmos_claim(message: Any) -> MsgSendToCosmosClaim {
-    let send_to_cosmos_claim_any = prost_types::Any {
-        type_url: MSG_SEND_TO_COSMOS_CLAIM.to_string(),
-        value: message.value,
-    };
-    decode_any(send_to_cosmos_claim_any).unwrap()
-}
-
-fn decode_msg_send_to_eth(message: Any) -> MsgSendToEth {
-    let send_to_eth_any = prost_types::Any {
-        type_url: MSG_SEND_TO_ETH.to_string(),
-        value: message.value,
-    };
-    decode_any(send_to_eth_any).unwrap()
-}
-
-/// Merges multiple `SearchReturn` instances into one.
-/// This function combines the messages and block timestamps from multiple search results.
-/// For `MsgSendToCosmosClaim` messages, it ensures there are no duplicates by retaining only one copy per `event_nonce`.
-///
-/// # Arguments
-///
-/// * `search_results` - A vector of `SearchReturn` instances to be merged.
-///
-/// # Returns
-///
-/// * A single `SearchReturn` instance with combined messages and block timestamps,
-///   and deduplicated `MsgSendToCosmosClaim` messages.
-fn merge_search_results(search_results: Vec<SearchReturn>) -> SearchReturn {
-    let mut merged = HashMap::new();
-    let mut block_timestamps = HashMap::new();
-    // map of claim nonces used to discard repeats
-    let mut cosmos_claims: HashSet<u64> = HashSet::new();
-
-    for search_result in search_results {
-        for (block_num, messages) in search_result.messages {
-            let merged_messages = merged.entry(block_num).or_insert_with(Vec::new);
-            for message in messages {
-                if let MessageWrapper::SendToCosmosClaim { claim, .. } = &message {
-                    if !cosmos_claims.contains(&claim.event_nonce) {
-                        cosmos_claims.insert(claim.event_nonce);
-                        merged_messages.push(message);
-                    }
-                } else {
-                    merged_messages.push(message);
-                }
-            }
-        }
-        block_timestamps.extend(search_result.block_timestamps);
-    }
-
-    SearchReturn {
-        messages: merged,
-        block_timestamps,
-    }
 }
 
 fn format_duration_long(duration: Duration) -> String {
@@ -455,6 +154,19 @@ fn format_duration_short(duration: Duration) -> String {
     format!("{}s {}ms", seconds, ms)
 }
 
+fn merge_search_results(search_results: Vec<SearchReturn>) -> SearchReturn {
+    let mut merged = HashMap::new();
+    let mut block_timestamps = HashMap::new();
+    for search_result in search_results {
+        merged.extend(search_result.messages);
+        block_timestamps.extend(search_result.block_timestamps);
+    }
+    SearchReturn {
+        messages: merged,
+        block_timestamps,
+    }
+}
+
 /// Downloads blocks and processes transactions in batches.
 ///
 /// # Arguments
@@ -471,7 +183,6 @@ fn format_duration_short(duration: Duration) -> String {
 /// * A `SearchReturn` instance containing the combined messages and block timestamps from all downloaded batches.
 async fn download_and_process_blocks(
     contact: &Contact,
-    target_address: Address,
     earliest_block: u64,
     latest_block: u64,
     batch_size: u64,
@@ -488,7 +199,7 @@ async fn download_and_process_blocks(
             pos = latest_block;
             latest_block
         };
-        let fut = search(&contact, target_address.clone(), start, end);
+        let fut = search(contact, start, end);
         futures.push(fut);
     }
 
@@ -546,10 +257,6 @@ const DEFAULT_RPC: &str = "https://gravitychain.io:9090";
 #[derive(Parser)]
 #[clap(version = env!("CARGO_PKG_VERSION"), author = "Justin Kilpatrick <justin@althea.net>")]
 struct Opts {
-    /// Target account to generate a csv for
-    #[arg(short, long)]
-    target_account: Address,
-
     /// rpc url to use
     #[arg(short, long, default_value = DEFAULT_RPC)]
     rpc: String,
@@ -588,10 +295,9 @@ async fn main() {
     env_logger::init();
 
     let args = Opts::parse();
-    let prefix = args.target_account.get_prefix();
     let timeout = Duration::from_secs(args.timeout);
 
-    let contact = Contact::new(&args.rpc, timeout, &prefix).expect("invalid url");
+    let contact = Contact::new(&args.rpc, timeout, "gravity").expect("invalid url");
 
     let mut status = contact.get_latest_block().await;
     while status.is_err() {
@@ -613,6 +319,8 @@ async fn main() {
         Some(block) => block,
         None => get_earliest_block(&contact, 0, latest_block).await,
     };
+    // no reason to search blocks before the auction module was deployed
+    let earliest_block = max(earliest_block, 9244100);
     info!(
         "This node has {} blocks to download, starting clock now",
         latest_block - earliest_block
@@ -624,7 +332,6 @@ async fn main() {
 
     let final_merged = download_and_process_blocks(
         &contact,
-        args.target_account,
         earliest_block,
         latest_block,
         batch_size,
@@ -633,7 +340,7 @@ async fn main() {
     .await;
 
     // now we make a csv of the resulting messages
-    make_csv(final_merged, args.target_account);
+    make_csv(final_merged);
 
     let elapsed = start.elapsed();
     info!(
@@ -858,15 +565,15 @@ fn translate_coin<T: Into<Coin>>(coin: T) -> FractionalCoin {
 /// # Panics
 ///
 /// * This function will panic if it fails to write to the CSV file.
-fn make_csv(input: SearchReturn, target_address: Address) {
+fn make_csv(input: SearchReturn) {
     let mut wtr = Writer::from_writer(vec![]);
-    wtr.write_record(&[
+    wtr.write_record([
         "Timestamp",
-        "Transaction To",
-        "Transaction From",
-        "Type",
+        "Bidder",
         "Token Type",
         "Amount",
+        "Bid",
+        "Winner?",
         "Block",
         "TxHash",
     ])
@@ -883,151 +590,42 @@ fn make_csv(input: SearchReturn, target_address: Address) {
 
         if let Some(messages) = input.messages.get(&block) {
             for message in messages {
-                match message {
-                    MessageWrapper::Send { send: msg, txhash } => {
-                        let translated_coin = translate_coin(msg.amount[0].clone());
-                        wtr.write_record(&[
-                            formatted_timestamp.clone(),
-                            msg.to_address.clone(),
-                            msg.from_address.clone(),
-                            "SendTokens".to_string(),
-                            translated_coin.denom.clone(),
-                            translated_coin.amount.to_string(),
-                            block.to_string(),
-                            txhash.clone(),
-                        ])
-                        .unwrap();
-                    }
-                    MessageWrapper::Reward {
-                        validator,
-                        delegator,
-                        amounts,
-                        txhash,
-                    } => {
-                        for amount in amounts {
-                            let translated_coin = translate_coin(amount.clone());
-                            wtr.write_record(&[
-                                formatted_timestamp.clone(),
-                                delegator.to_string(),
-                                validator.to_string(),
-                                "WithdrawStakingReward".to_string(),
-                                translated_coin.denom.clone(),
-                                translated_coin.amount.to_string().clone(),
-                                block.to_string(),
-                                txhash.clone(),
-                            ])
-                            .unwrap();
-                        }
-                    }
-                    MessageWrapper::Delegate {
-                        delegate: msg,
-                        txhash,
-                    } => {
-                        let translated_coin = translate_coin(msg.clone().amount.unwrap());
-                        wtr.write_record(&[
-                            formatted_timestamp.clone(),
-                            msg.delegator_address.clone(),
-                            msg.validator_address.clone(),
-                            "Delegate".to_string(),
-                            translated_coin.denom.clone(),
-                            translated_coin.amount.to_string(),
-                            block.to_string(),
-                            txhash.clone(),
-                        ])
-                        .unwrap();
-                    }
-                    MessageWrapper::UnDelegate {
-                        undelegate: msg,
-                        txhash,
-                    } => {
-                        let translated_coin = translate_coin(msg.clone().amount.unwrap());
-                        wtr.write_record(&[
-                            formatted_timestamp.clone(),
-                            msg.validator_address.clone(),
-                            msg.delegator_address.clone(),
-                            "UnDelegate".to_string(),
-                            translated_coin.denom.clone(),
-                            translated_coin.amount.to_string(),
-                            block.to_string(),
-                            txhash.clone(),
-                        ])
-                        .unwrap();
-                    }
-                    MessageWrapper::Transfer {
-                        transfer: msg,
-                        txhash,
-                    } => {
-                        let translated_coin = translate_coin(msg.clone().token.unwrap());
-                        wtr.write_record(&[
-                            formatted_timestamp.clone(),
-                            msg.receiver.clone(),
-                            msg.sender.clone(),
-                            "IbcTransfer".to_string(),
-                            translated_coin.denom.clone(),
-                            translated_coin.amount.to_string(),
-                            block.to_string(),
-                            txhash.clone(),
-                        ])
-                        .unwrap();
-                    }
-                    MessageWrapper::RecvPacket {
-                        sender,
-                        reciver,
-                        amount,
-                        txhash,
-                    } => {
-                        let translated_coin = translate_coin(amount.clone());
-                        wtr.write_record(&[
-                            formatted_timestamp.clone(),
-                            reciver.to_string(),
-                            sender.to_string(),
-                            "IbcRecieve".to_string(),
-                            translated_coin.denom.clone(),
-                            translated_coin.amount.to_string(),
-                            block.to_string(),
-                            txhash.clone(),
-                        ])
-                        .unwrap();
-                    }
-                    MessageWrapper::SendToCosmosClaim { claim: msg, txhash } => {
-                        let translated_coin = translate_coin(Coin {
-                            denom: format!("gravity{}", msg.token_contract.clone()),
-                            amount: msg.amount.clone().parse().unwrap(),
-                        });
-                        wtr.write_record(&[
-                            formatted_timestamp.clone(),
-                            msg.cosmos_receiver.clone(),
-                            msg.ethereum_sender.clone(),
-                            "SendToGravity".to_string(),
-                            translated_coin.denom.clone(),
-                            translated_coin.amount.to_string(),
-                            block.to_string(),
-                            txhash.clone(),
-                        ])
-                        .unwrap();
-                    }
-                    MessageWrapper::SendToEth { send: msg, txhash } => {
-                        let translated_coin = translate_coin(msg.amount.clone().unwrap());
-                        wtr.write_record(&[
-                            formatted_timestamp.clone(),
-                            msg.eth_dest.clone(),
-                            msg.sender.clone(),
-                            "SendToEth".to_string(),
-                            translated_coin.denom.clone(),
-                            translated_coin.amount.to_string(),
-                            block.to_string(),
-                            txhash.clone(),
-                        ])
-                        .unwrap();
-                    }
-                }
+                let auction_amount = translate_coin(message.auction.clone().amount.unwrap());
+                let bid_amount_coin = Coin {
+                    amount: message.send.amount.into(),
+                    denom: "ugravition".to_string(),
+                };
+                wtr.write_record(&[
+                    formatted_timestamp.clone(),
+                    message.send.bidder.clone(),
+                    auction_amount.denom.clone(),
+                    auction_amount.amount.to_string(),
+                    translate_coin(bid_amount_coin).amount.to_string(),
+                    is_winning_bid(&input, message.auction.id, message.send.amount).to_string(),
+                    block.to_string(),
+                    message.txhash.clone(),
+                ])
+                .unwrap();
             }
         }
     }
 
     wtr.flush().unwrap();
     let data = String::from_utf8(wtr.into_inner().unwrap()).unwrap();
-    std::fs::write(format!("{}.csv", target_address), data).expect("Failed to write to file");
+    std::fs::write("auction-data.csv", data).expect("Failed to write to file");
+}
+
+fn is_winning_bid(input: &SearchReturn, auction_id: u64, amount: u64) -> bool {
+    let mut highest_bid_for_this_auction = 0;
+    for messages in input.messages.values() {
+        for message in messages {
+            if message.auction.id == auction_id {
+                highest_bid_for_this_auction =
+                    max(highest_bid_for_this_auction, message.send.amount);
+            }
+        }
+    }
+    amount == highest_bid_for_this_auction
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
