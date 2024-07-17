@@ -639,6 +639,7 @@ fn make_csv(input: SearchReturn) {
     wtr.write_record([
         "Timestamp",
         "Bidder",
+        "Auction Number",
         "Token Type",
         "Amount",
         "Bid",
@@ -667,6 +668,7 @@ fn make_csv(input: SearchReturn) {
                 wtr.write_record(&[
                     formatted_timestamp.clone(),
                     message.send.bidder.clone(),
+                    message.auction.id.to_string(),
                     auction_amount.denom.clone(),
                     auction_amount.amount.to_string(),
                     translate_coin(bid_amount_coin).amount.to_string(),
